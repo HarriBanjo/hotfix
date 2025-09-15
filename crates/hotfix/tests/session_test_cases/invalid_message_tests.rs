@@ -1,12 +1,13 @@
 use crate::common::actions::when;
 use crate::common::assertions::then;
-use crate::common::setup::given_an_active_session;
+use crate::common::setup::{COUNTERPARTY_COMP_ID, OUR_COMP_ID, given_an_active_session};
 use crate::common::test_messages::{TestMessage, replace_field_value};
 use hotfix::message::{FixMessage, generate_message};
 use hotfix::session::Status;
 use hotfix_message::dict::{FieldLocation, FixDatatype};
+use hotfix_message::field_types::Timestamp;
 use hotfix_message::fix44::MSG_TYPE;
-use hotfix_message::message::Message;
+use hotfix_message::message::{Config, Message};
 use hotfix_message::{HardCodedFixFieldDefinition, Part, fix44};
 
 /// Tests that when a counterparty sends a message containing an invalid/unrecognised field,
@@ -34,8 +35,6 @@ async fn test_garbled_message_with_invalid_target_comp_id_gets_ignored() {
 
     // counterparty sends a message with invalid body length, which constitutes a garbled message
     let garbled_message = build_execution_report_with_incorrect_body_length(
-        "dummy-acceptor",
-        "dummy-initiator",
         mock_counterparty.next_target_sequence_number(),
     );
     when(&mut mock_counterparty)
@@ -56,6 +55,79 @@ async fn test_garbled_message_with_invalid_target_comp_id_gets_ignored() {
         .await;
 
     when(&session).requests_disconnect().await;
+    then(&mut mock_counterparty).gets_disconnected().await;
+}
+
+/// Tests that when a counterparty sends a message with an invalid BeginString,
+/// the session logs out and disconnects.
+#[tokio::test]
+async fn test_message_with_invalid_begin_string() {
+    let (_session, mut mock_counterparty) = given_an_active_session().await;
+
+    // a message with invalid BeginString is sent by the counterparty
+    let invalid_message = build_execution_report_with_incorrect_begin_string(
+        mock_counterparty.next_target_sequence_number(),
+    );
+    when(&mut mock_counterparty)
+        .sends_raw_message(invalid_message)
+        .await;
+
+    // then we log out and disconnect
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "5"))
+        .await;
+    then(&mut mock_counterparty).gets_disconnected().await;
+}
+
+/// Tests that when a counterparty sends a message with an invalid TargetCompId,
+/// the session sends a Reject (MsgType=3) and logs out and disconnects.
+#[tokio::test]
+async fn test_message_with_invalid_target_comp_id() {
+    let (_session, mut mock_counterparty) = given_an_active_session().await;
+
+    // a message with incorrect TargetCompId is sent by the counterparty
+    let invalid_message = build_execution_report_with_comp_id(
+        mock_counterparty.next_target_sequence_number(),
+        COUNTERPARTY_COMP_ID,
+        "WRONG_COMP_ID",
+    );
+    when(&mut mock_counterparty)
+        .sends_raw_message(invalid_message)
+        .await;
+
+    // then we send a reject, log out and disconnect
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "3"))
+        .await;
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "5"))
+        .await;
+    then(&mut mock_counterparty).gets_disconnected().await;
+}
+
+/// Tests that when a counterparty sends a message with an invalid SenderCompId,
+/// the session sends a Reject (MsgType=3) and logs out and disconnects.
+#[tokio::test]
+async fn test_message_with_invalid_sender_comp_id() {
+    let (_session, mut mock_counterparty) = given_an_active_session().await;
+
+    // a message with incorrect SenderCompId is sent by the counterparty
+    let invalid_message = build_execution_report_with_comp_id(
+        mock_counterparty.next_target_sequence_number(),
+        "WRONG_COMP_ID",
+        OUR_COMP_ID,
+    );
+    when(&mut mock_counterparty)
+        .sends_raw_message(invalid_message)
+        .await;
+
+    // then we send a reject, log out and disconnect
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "3"))
+        .await;
+    then(&mut mock_counterparty)
+        .receives(|msg| assert_eq!(msg.header().get::<&str>(MSG_TYPE).unwrap(), "5"))
+        .await;
     then(&mut mock_counterparty).gets_disconnected().await;
 }
 
@@ -121,16 +193,45 @@ pub const CUSTOM_FIELD: &HardCodedFixFieldDefinition = &HardCodedFixFieldDefinit
     location: FieldLocation::Body,
 };
 
-fn build_execution_report_with_incorrect_body_length(
-    sender_comp_id: &str,
-    target_comp_id: &str,
-    msg_seq_num: usize,
-) -> Vec<u8> {
+fn build_execution_report_with_incorrect_body_length(msg_seq_num: usize) -> Vec<u8> {
     let report = TestMessage::dummy_execution_report();
     let mut raw_message =
-        generate_message(sender_comp_id, target_comp_id, msg_seq_num, report).unwrap();
+        generate_message(COUNTERPARTY_COMP_ID, OUR_COMP_ID, msg_seq_num, report).unwrap();
 
     replace_field_value(&mut raw_message, 9, b"999");
 
     raw_message
+}
+
+fn build_execution_report_with_incorrect_begin_string(msg_seq_num: usize) -> Vec<u8> {
+    let report = TestMessage::dummy_execution_report();
+
+    // we expect BeginString FIX.4.4 but this message contains FIX.4.2
+    let mut msg = Message::new("FIX.4.2", report.message_type());
+    msg.set(fix44::SENDER_COMP_ID, COUNTERPARTY_COMP_ID);
+    msg.set(fix44::TARGET_COMP_ID, OUR_COMP_ID);
+    msg.set(fix44::MSG_SEQ_NUM, msg_seq_num);
+    msg.set(fix44::SENDING_TIME, Timestamp::utc_now());
+
+    report.write(&mut msg);
+
+    msg.encode(&Config::default()).unwrap()
+}
+
+fn build_execution_report_with_comp_id(
+    msg_seq_num: usize,
+    sender_comp_id: &str,
+    target_comp_id: &str,
+) -> Vec<u8> {
+    let report = TestMessage::dummy_execution_report();
+
+    let mut msg = Message::new("FIX.4.4", report.message_type());
+    msg.set(fix44::SENDER_COMP_ID, sender_comp_id);
+    msg.set(fix44::TARGET_COMP_ID, target_comp_id);
+    msg.set(fix44::MSG_SEQ_NUM, msg_seq_num);
+    msg.set(fix44::SENDING_TIME, Timestamp::utc_now());
+
+    report.write(&mut msg);
+
+    msg.encode(&Config::default()).unwrap()
 }
