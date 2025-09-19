@@ -10,6 +10,7 @@ use tokio::time::Instant;
 use tracing::{debug, error};
 
 const TEST_REQUEST_THRESHOLD: f64 = 1.2;
+const MAX_RESEND_ATTEMPTS: usize = 3;
 
 pub(crate) type TestRequestId = String;
 
@@ -136,19 +137,28 @@ impl SessionState {
         }
     }
 
-    pub fn try_transition_to_awaiting_resend(&mut self, end_seq_number: u64) -> bool {
-        if matches!(self, SessionState::AwaitingLogout { .. }) {
-            error!("trying to request a resend while we are already logging out");
-            return false;
-        }
-
-        if let Some(writer) = self.get_writer() {
-            let awaiting_resend = AwaitingResendState::new(writer.to_owned(), end_seq_number);
-            *self = SessionState::AwaitingResend(awaiting_resend);
-            true
-        } else {
-            error!("trying to transition to awaiting resend without an established connection");
-            false
+    pub fn try_transition_to_awaiting_resend(
+        &mut self,
+        begin: u64,
+        end: u64,
+    ) -> AwaitingResendTransitionOutcome {
+        match self {
+            SessionState::AwaitingLogon { writer, .. }
+            | SessionState::Active(ActiveState { writer, .. }) => {
+                let awaiting_resend = AwaitingResendState::new(writer.to_owned(), begin, end);
+                *self = SessionState::AwaitingResend(awaiting_resend);
+                AwaitingResendTransitionOutcome::Success
+            }
+            SessionState::AwaitingResend(state) => state.update(begin, end),
+            SessionState::AwaitingLogout { .. } => AwaitingResendTransitionOutcome::InvalidState(
+                "trying to request a resend while we are already logging out".to_string(),
+            ),
+            SessionState::LoggedOut { .. } | SessionState::Disconnected(_) => {
+                AwaitingResendTransitionOutcome::InvalidState(
+                    "trying to transition to awaiting resend without an established connection"
+                        .to_string(),
+                )
+            }
         }
     }
 
@@ -256,7 +266,16 @@ impl SessionState {
     pub fn as_status(&self) -> SessionInfoStatus {
         match self {
             SessionState::AwaitingLogon { .. } => SessionInfoStatus::AwaitingLogon,
-            SessionState::AwaitingResend(_) => SessionInfoStatus::AwaitingResend,
+            SessionState::AwaitingResend(AwaitingResendState {
+                begin_seq_number,
+                end_seq_number,
+                resend_attempts,
+                ..
+            }) => SessionInfoStatus::AwaitingResend {
+                begin: *begin_seq_number,
+                end: *end_seq_number,
+                attempts: *resend_attempts,
+            },
             SessionState::AwaitingLogout { .. } => SessionInfoStatus::AwaitingLogout,
             SessionState::Active(_) => SessionInfoStatus::Active,
             SessionState::LoggedOut { .. } => SessionInfoStatus::LoggedOut,
@@ -285,19 +304,48 @@ pub struct ActiveState {
 pub struct AwaitingResendState {
     /// The reference to the writer loop.
     pub(crate) writer: WriterRef,
+    /// The beginning of the gap we're waiting for the target to resend.
+    pub(crate) begin_seq_number: u64,
     /// The end of the gap we're waiting for the target to resend.
     pub(crate) end_seq_number: u64,
     /// Inbound messages we receive while processing the resend.
     pub(crate) inbound_queue: VecDeque<Message>,
+    /// The number of times we've attempted to ask the counterparty to resend the gap.
+    pub(crate) resend_attempts: usize,
 }
 
 impl AwaitingResendState {
-    pub fn new(writer: WriterRef, end_seq_number: u64) -> Self {
+    fn new(writer: WriterRef, begin_seq_number: u64, end_seq_number: u64) -> Self {
         Self {
             writer,
+            begin_seq_number,
             end_seq_number,
             inbound_queue: Default::default(),
+            resend_attempts: 1,
         }
+    }
+
+    fn update(
+        &mut self,
+        begin_seq_number: u64,
+        end_seq_number: u64,
+    ) -> AwaitingResendTransitionOutcome {
+        let resend_attempts = if self.begin_seq_number == begin_seq_number {
+            if self.resend_attempts + 1 > MAX_RESEND_ATTEMPTS {
+                return AwaitingResendTransitionOutcome::AttemptsExceeded;
+            }
+            self.resend_attempts + 1
+        } else if begin_seq_number < self.begin_seq_number {
+            return AwaitingResendTransitionOutcome::BeginSeqNumberTooLow;
+        } else {
+            1
+        };
+
+        self.resend_attempts = resend_attempts;
+        self.begin_seq_number = begin_seq_number;
+        self.end_seq_number = end_seq_number;
+
+        AwaitingResendTransitionOutcome::Success
     }
 }
 
@@ -326,5 +374,77 @@ impl DisconnectedState {
 
     fn take_session_awaiter(&mut self) -> Option<oneshot::Sender<AwaitingActiveSessionResponse>> {
         self.session_awaiter.take()
+    }
+}
+
+pub enum AwaitingResendTransitionOutcome {
+    Success,
+    InvalidState(String),
+    BeginSeqNumberTooLow,
+    AttemptsExceeded,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn test_awaiting_resend_transition_begin_seq_number_too_low() {
+        let writer = create_writer_ref();
+        let mut state = SessionState::AwaitingResend(AwaitingResendState::new(writer, 1, 5));
+        let result = state.try_transition_to_awaiting_resend(0, 5);
+        assert!(matches!(
+            result,
+            AwaitingResendTransitionOutcome::BeginSeqNumberTooLow
+        ));
+    }
+
+    #[test]
+    fn test_awaiting_resend_transition_attempts_exceeded() {
+        let writer = create_writer_ref();
+        let mut state = SessionState::AwaitingResend(AwaitingResendState::new(writer, 1, 5));
+
+        // we can transition twice more without hitting the limit
+        let result = state.try_transition_to_awaiting_resend(1, 5);
+        assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
+        let result = state.try_transition_to_awaiting_resend(1, 5);
+        assert!(matches!(result, AwaitingResendTransitionOutcome::Success));
+
+        // the fourth time we'd get into an AwaitingResendState with the same begin seq number, we get an error
+        let result = state.try_transition_to_awaiting_resend(1, 5);
+        assert!(matches!(
+            result,
+            AwaitingResendTransitionOutcome::AttemptsExceeded
+        ));
+    }
+
+    #[test]
+    fn test_awaiting_resend_transition_when_logged_out_is_prevented() {
+        let mut state = SessionState::LoggedOut { reconnect: false };
+
+        let result = state.try_transition_to_awaiting_resend(1, 5);
+        assert!(matches!(
+            result,
+            AwaitingResendTransitionOutcome::InvalidState(_)
+        ));
+    }
+
+    #[test]
+    fn test_awaiting_resend_transition_when_awaiting_logout_is_prevented() {
+        let mut state = SessionState::AwaitingLogout {
+            writer: create_writer_ref(),
+        };
+
+        let result = state.try_transition_to_awaiting_resend(1, 5);
+        assert!(matches!(
+            result,
+            AwaitingResendTransitionOutcome::InvalidState(_)
+        ));
+    }
+
+    fn create_writer_ref() -> WriterRef {
+        let (sender, _) = mpsc::channel(10);
+        WriterRef::new(sender)
     }
 }

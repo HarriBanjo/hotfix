@@ -32,7 +32,7 @@ use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
 use crate::message_utils::is_admin;
 use crate::session::event::AwaitingActiveSessionResponse;
-use crate::session::state::TestRequestId;
+use crate::session::state::{AwaitingResendTransitionOutcome, TestRequestId};
 use crate::session_schedule::SessionSchedule;
 use event::SessionEvent;
 use hotfix_message::fix44::SessionRejectReason;
@@ -331,14 +331,14 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         match actual_seq_number.cmp(&expected_seq_number) {
             Ordering::Greater => {
                 return Err(MessageVerificationError::SeqNumberTooHigh {
-                    actual: actual_seq_number,
                     expected: expected_seq_number,
+                    actual: actual_seq_number,
                 });
             }
             Ordering::Less => {
                 return Err(MessageVerificationError::SeqNumberTooLow {
-                    actual: actual_seq_number,
                     expected: expected_seq_number,
+                    actual: actual_seq_number,
                 });
             }
             _ => {}
@@ -521,11 +521,11 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
 
     async fn handle_verification_error(&mut self, error: MessageVerificationError) {
         match error {
-            MessageVerificationError::SeqNumberTooLow { actual, expected } => {
-                self.handle_sequence_number_too_low(actual, expected).await;
+            MessageVerificationError::SeqNumberTooLow { expected, actual } => {
+                self.handle_sequence_number_too_low(expected, actual).await;
             }
-            MessageVerificationError::SeqNumberTooHigh { actual, expected } => {
-                self.handle_sequence_number_too_high(actual, expected).await;
+            MessageVerificationError::SeqNumberTooHigh { expected, actual } => {
+                self.handle_sequence_number_too_high(expected, actual).await;
             }
             MessageVerificationError::IncorrectBeginString(begin_string) => {
                 self.handle_incorrect_begin_string(begin_string).await;
@@ -566,7 +566,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
             .await;
     }
 
-    async fn handle_sequence_number_too_low(&mut self, actual: u64, expected: u64) {
+    async fn handle_sequence_number_too_low(&mut self, expected: u64, actual: u64) {
         error!(
             "we expected {expected} sequence number, but target sent lower ({actual}), terminating..."
         );
@@ -575,10 +575,34 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         self.state = SessionState::LoggedOut { reconnect: false };
     }
 
-    async fn handle_sequence_number_too_high(&mut self, actual: u64, expected: u64) {
-        if self.state.try_transition_to_awaiting_resend(actual) {
-            debug!("we are behind target (ours: {expected}, theirs: {actual}), requesting resend.");
-            self.send_resend_request(expected, actual).await;
+    async fn handle_sequence_number_too_high(&mut self, expected: u64, actual: u64) {
+        match self
+            .state
+            .try_transition_to_awaiting_resend(expected, actual)
+        {
+            AwaitingResendTransitionOutcome::Success => {
+                debug!(
+                    "we are behind target (ours: {expected}, theirs: {actual}), requesting resend."
+                );
+                self.send_resend_request(expected, actual).await;
+            }
+            AwaitingResendTransitionOutcome::InvalidState(reason) => {
+                error!("failed to request resend: {reason}");
+            }
+            AwaitingResendTransitionOutcome::BeginSeqNumberTooLow => {
+                self.state.disconnect().await;
+                self.state = SessionState::new_disconnected(
+                    false,
+                    "awaiting resend begin seq number unexpectedly lower than the previous resend request's",
+                );
+            }
+            AwaitingResendTransitionOutcome::AttemptsExceeded => {
+                self.state.disconnect().await;
+                self.state = SessionState::new_disconnected(
+                    false,
+                    "resend request attempts exceeded, manual intervention required",
+                );
+            }
         }
     }
 
@@ -663,7 +687,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         let msg = generate_message(
             &self.config.sender_comp_id,
             &self.config.target_comp_id,
-            seq_num as usize,
+            seq_num,
             message,
         )
         .unwrap();
@@ -686,7 +710,7 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
         let raw_message = generate_message(
             &self.config.sender_comp_id,
             &self.config.target_comp_id,
-            begin as usize,
+            begin,
             sequence_reset,
         )
         .unwrap();
