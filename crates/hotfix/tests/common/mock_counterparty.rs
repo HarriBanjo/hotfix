@@ -61,11 +61,41 @@ where
         self.sent_messages.push(raw_message);
     }
 
-    pub async fn resend_message(&mut self, sequence_number: u64) {
-        let message = self.sent_messages[sequence_number as usize - 1].clone();
-        self.session_ref
-            .new_fix_message_received(RawFixMessage::new(message))
-            .await;
+    pub async fn resend_message(&mut self, sequence_number: u64, skip_updates: bool) {
+        let index = sequence_number as usize - 1;
+        assert!(
+            index < self.sent_messages.len(),
+            "attempted to resend unknown sequence number {sequence_number}"
+        );
+        let original_raw = self.sent_messages[index].clone();
+
+        if skip_updates {
+            self.session_ref
+                .new_fix_message_received(RawFixMessage::new(original_raw))
+                .await;
+            return;
+        }
+
+        let parsed = Message::from_bytes(&self.message_config, &self.dictionary, &original_raw);
+        let mut message = match parsed {
+            ParsedMessage::Valid(m) => m,
+            _ => panic!("trying to resend invalid message"),
+        };
+
+        if let Err(err) = hotfix::message_utils::prepare_message_for_resend(&mut message) {
+            panic!("failed to prepare message for resend: {err:?}");
+        }
+
+        match message.encode(&self.message_config) {
+            Ok(resent_raw) => {
+                self.session_ref
+                    .new_fix_message_received(RawFixMessage::new(resent_raw))
+                    .await;
+            }
+            Err(err) => {
+                panic!("failed to encode message for resend: {err:?}");
+            }
+        }
     }
 
     pub async fn send_gap_fill(&mut self, start_seq_no: u64, new_seq_no: u64) {
@@ -111,6 +141,10 @@ where
         self.session_ref
             .new_fix_message_received(RawFixMessage::new(raw_message))
             .await;
+    }
+
+    pub fn delete_last_message_from_store(&mut self) -> bool {
+        self.sent_messages.pop().is_some()
     }
 
     /// Waits for and returns the next message received from the session.

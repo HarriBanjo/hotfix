@@ -6,9 +6,8 @@ mod state;
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use hotfix_message::dict::Dictionary;
-use hotfix_message::field_types::Timestamp;
 use hotfix_message::message::{Config as MessageConfig, Message};
-use hotfix_message::{FieldType, Part, fix44};
+use hotfix_message::{Part, fix44};
 use std::cmp::Ordering;
 use std::pin::Pin;
 use tokio::select;
@@ -31,11 +30,11 @@ use crate::message::logout::Logout;
 use crate::message::resend_request::ResendRequest;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
-use crate::message_utils::is_admin;
+use crate::message_utils::{is_admin, prepare_message_for_resend};
 use crate::session::state::{AwaitingResendTransitionOutcome, TestRequestId};
 use crate::session_schedule::SessionSchedule;
 use event::SessionEvent;
-use hotfix_message::fix44::SessionRejectReason;
+use hotfix_message::fix44::{POSS_DUP_FLAG, SessionRejectReason};
 use hotfix_message::parsed_message::{InvalidReason, ParsedMessage};
 use state::SessionState;
 
@@ -264,9 +263,12 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
                 });
             }
             Ordering::Less => {
+                let possible_duplicate =
+                    message.header().get::<bool>(POSS_DUP_FLAG).unwrap_or(false);
                 return Err(MessageVerificationError::SeqNumberTooLow {
                     expected: expected_seq_number,
                     actual: actual_seq_number,
+                    possible_duplicate,
                 });
             }
             _ => {}
@@ -449,8 +451,13 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
 
     async fn handle_verification_error(&mut self, error: MessageVerificationError) {
         match error {
-            MessageVerificationError::SeqNumberTooLow { expected, actual } => {
-                self.handle_sequence_number_too_low(expected, actual).await;
+            MessageVerificationError::SeqNumberTooLow {
+                expected,
+                actual,
+                possible_duplicate,
+            } => {
+                self.handle_sequence_number_too_low(expected, actual, possible_duplicate)
+                    .await;
             }
             MessageVerificationError::SeqNumberTooHigh { expected, actual } => {
                 self.handle_sequence_number_too_high(expected, actual).await;
@@ -494,7 +501,18 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
             .await;
     }
 
-    async fn handle_sequence_number_too_low(&mut self, expected: u64, actual: u64) {
+    async fn handle_sequence_number_too_low(
+        &mut self,
+        expected: u64,
+        actual: u64,
+        possible_duplicate: bool,
+    ) {
+        if possible_duplicate {
+            warn!(
+                "sequence number too low (expected {expected}, actual {actual}, but counterparty indicated it's poss duplicate, ignoring"
+            );
+            return;
+        }
         error!(
             "we expected {expected} sequence number, but target sent lower ({actual}), terminating..."
         );
@@ -595,7 +613,12 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
                 reset_start = None;
             }
 
-            Self::prepare_message_for_resend(&mut message);
+            if let Err(e) = prepare_message_for_resend(&mut message) {
+                error!(
+                    error = e,
+                    "failed to prepare message for resend, sending original"
+                );
+            }
             self.send_raw(
                 message_type.as_bytes(),
                 message.encode(&self.message_config).unwrap(),
@@ -609,15 +632,6 @@ impl<M: FixMessage, S: MessageStore> Session<M, S> {
             let end = sequence_number;
             self.send_sequence_reset(begin, end).await;
         }
-    }
-
-    fn prepare_message_for_resend(msg: &mut Message) {
-        let header = msg.header_mut();
-        let raw_sending_time = header.pop(fix44::SENDING_TIME).unwrap();
-        let original_sending_time = Timestamp::deserialize(&raw_sending_time.data).unwrap();
-        header.set(fix44::ORIG_SENDING_TIME, original_sending_time);
-        header.set(fix44::SENDING_TIME, Timestamp::utc_now());
-        header.set(fix44::POSS_DUP_FLAG, true);
     }
 
     fn reset_heartbeat_timer(&mut self) {
