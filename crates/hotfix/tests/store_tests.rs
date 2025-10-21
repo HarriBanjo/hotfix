@@ -1,5 +1,9 @@
+use std::path::PathBuf;
+use std::{env, fs};
+
 use chrono::Utc;
 use hotfix::store::MessageStore;
+use hotfix::store::file::FileStore;
 use hotfix::store::in_memory::InMemoryMessageStore;
 
 #[tokio::test]
@@ -339,6 +343,9 @@ async fn create_test_store_factories() -> Vec<Box<dyn TestStoreFactory>> {
     // Add in-memory store factory
     stores.push(Box::new(InMemoryMessageStoreTestFactory {}) as Box<dyn TestStoreFactory>);
 
+    // Add file store factory
+    stores.push(Box::new(FileStoreTestFactory::new()) as Box<dyn TestStoreFactory>);
+
     // Add redb store factory if the feature is enabled
     #[cfg(feature = "redb")]
     {
@@ -368,6 +375,36 @@ impl TestStoreFactory for InMemoryMessageStoreTestFactory {
 
     fn is_persistent(&self) -> bool {
         false
+    }
+}
+
+pub(crate) struct FileStoreTestFactory {
+    directory: PathBuf,
+    name: String,
+}
+
+impl FileStoreTestFactory {
+    pub(crate) fn new() -> Self {
+        Self {
+            directory: env::temp_dir(),
+            name: format!("file_store_test_{}", uuid::Uuid::new_v4()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TestStoreFactory for FileStoreTestFactory {
+    async fn create_store(&self) -> Box<dyn MessageStore> {
+        Box::new(FileStore::new(&self.directory, &self.name).expect("Failed to create file store"))
+    }
+}
+
+impl Drop for FileStoreTestFactory {
+    fn drop(&mut self) {
+        let base_path = self.directory.join(&self.name);
+        for ext in ["header", "body", "seqnums", "session"] {
+            let _ = fs::remove_file(base_path.with_extension(ext));
+        }
     }
 }
 
