@@ -1,7 +1,8 @@
 use crate::{Component, ComponentData, Datatype, DatatypeData, Field, FieldData};
 
+use crate::error::ParseError;
 use crate::message_definition::{MessageData, MessageDefinition};
-use crate::quickfix::{ParseDictionaryError, QuickFixReader};
+use crate::quickfix::QuickFixReader;
 use crate::string::SmartString;
 use fnv::FnvHashMap;
 
@@ -52,9 +53,9 @@ impl Dictionary {
 
     /// Attempts to read a QuickFIX-style specification file and convert it into
     /// a [`Dictionary`].
-    pub fn from_quickfix_spec(input: &str) -> Result<Self, ParseDictionaryError> {
+    pub fn from_quickfix_spec(input: &str) -> Result<Self, ParseError> {
         let xml_document =
-            roxmltree::Document::parse(input).map_err(|_| ParseDictionaryError::InvalidFormat)?;
+            roxmltree::Document::parse(input).map_err(|_| ParseError::InvalidFormat)?;
         QuickFixReader::new(&xml_document)
     }
 
@@ -71,7 +72,7 @@ impl Dictionary {
         self.version.as_str()
     }
 
-    pub fn load_from_file(path: &str) -> Result<Self, ParseDictionaryError> {
+    pub fn load_from_file(path: &str) -> Result<Self, ParseError> {
         let spec = std::fs::read_to_string(path)
             .unwrap_or_else(|_| panic!("unable to read FIX dictionary file at {path}"));
         Dictionary::from_quickfix_spec(&spec)
@@ -302,5 +303,31 @@ impl Dictionary {
             .values()
             .map(|data| Component(self, data))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_from_file_success() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/resources/quickfix/FIX-4.4.xml"
+        );
+        let dict = Dictionary::load_from_file(path).unwrap();
+        assert_eq!(dict.version(), "FIX.4.4");
+        assert!(dict.message_by_name("Heartbeat").is_some());
+    }
+
+    #[test]
+    fn test_load_from_file_invalid_content() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/test_data/quickfix_specs/empty_file.xml"
+        );
+        let result = Dictionary::load_from_file(path);
+        assert!(result.is_err());
     }
 }

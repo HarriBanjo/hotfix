@@ -13,7 +13,7 @@ use crate::message::parser::RawFixMessage;
 use crate::message::{InboundMessage, generate_message};
 use crate::store::MessageStore;
 use crate::transport::writer::WriterRef;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use hotfix_message::dict::Dictionary;
 use hotfix_message::message::{Config as MessageConfig, Message};
@@ -78,16 +78,15 @@ where
         config: SessionConfig,
         application: App,
         store: Store,
-    ) -> Session<App, Inbound, Outbound, Store> {
+    ) -> Result<Session<App, Inbound, Outbound, Store>> {
         let schedule_check_timer = sleep(Duration::from_secs(SCHEDULE_CHECK_INTERVAL));
 
-        let dictionary = Self::get_data_dictionary(&config);
+        let dictionary = Self::get_data_dictionary(&config)?;
         let message_config = MessageConfig::default();
-        let message_builder = MessageBuilder::new(dictionary, message_config)
-            .expect("failed to create message builder");
-        let schedule = config.schedule.as_ref().try_into().unwrap();
+        let message_builder = MessageBuilder::new(dictionary, message_config)?;
+        let schedule = config.schedule.as_ref().try_into()?;
 
-        Self {
+        let session = Self {
             config,
             schedule,
             message_config,
@@ -98,17 +97,19 @@ where
             schedule_check_timer: Box::pin(schedule_check_timer),
             reset_on_next_logon: false,
             _phantom: std::marker::PhantomData,
-        }
+        };
+
+        Ok(session)
     }
 
-    fn get_data_dictionary(config: &SessionConfig) -> Dictionary {
+    fn get_data_dictionary(config: &SessionConfig) -> Result<Dictionary> {
         match &config.data_dictionary_path {
             None => match config.begin_string.as_str() {
                 #[cfg(feature = "fix44")]
-                "FIX.4.4" => Dictionary::fix44(),
-                _ => panic!("unsupported begin string: {}", config.begin_string),
+                "FIX.4.4" => Ok(Dictionary::fix44()),
+                _ => bail!("unsupported begin string: {}", config.begin_string),
             },
-            Some(dictionary_path) => Dictionary::load_from_file(dictionary_path).unwrap(),
+            Some(dictionary_path) => Ok(Dictionary::load_from_file(dictionary_path)?),
         }
     }
 
@@ -138,7 +139,9 @@ where
                             let reject = Reject::new(msg_seq_num)
                                 .session_reject_reason(SessionRejectReason::InvalidTagNumber)
                                 .text(&format!("invalid field {tag}"));
-                            self.send_message(reject).await;
+                            self.send_message(reject)
+                                .await
+                                .context("failed to send reject")?;
                         }
                         Err(err) => {
                             error!("failed to get message seq num: {:?}", err);
@@ -160,7 +163,9 @@ where
                                     SessionRejectReason::RepeatingGroupFieldsOutOfOrder,
                                 )
                                 .text(&format!("field appears in incorrect order:{tag}"));
-                            self.send_message(reject).await;
+                            self.send_message(reject)
+                                .await
+                                .context("failed to send reject")?;
                         }
                         Err(err) => {
                             error!("failed to get message seq num: {:?}", err);
@@ -239,7 +244,10 @@ where
                 }
                 self.store.increment_target_seq_number().await?;
             }
-            Err(err) => self.handle_verification_error(err).await,
+            Err(err) => self
+                .handle_verification_error(err)
+                .await
+                .context("failed to handle verification error")?,
         }
 
         Ok(())
@@ -289,14 +297,16 @@ where
         verify_message(message, &self.config, expected_seq_number)
     }
 
-    async fn on_connect(&mut self, writer: WriterRef) {
+    async fn on_connect(&mut self, writer: WriterRef) -> Result<()> {
         self.state = SessionState::AwaitingLogon {
             writer,
             logon_sent: false,
             logon_timeout: Instant::now() + Duration::from_secs(self.config.logon_timeout),
         };
         self.reset_peer_timer(None);
-        self.send_logon().await;
+        self.send_logon().await?;
+
+        Ok(())
     }
 
     async fn on_disconnect(&mut self, reason: String) {
@@ -326,7 +336,10 @@ where
                     self.application.on_logon().await;
                     self.store.increment_target_seq_number().await?;
                 }
-                Err(err) => self.handle_verification_error(err).await,
+                Err(err) => self
+                    .handle_verification_error(err)
+                    .await
+                    .context("failed to handle verification error")?,
             }
         } else {
             error!("received unexpected logon message");
@@ -337,7 +350,7 @@ where
 
     async fn on_logout(&mut self) -> Result<()> {
         if self.state.is_logged_on() {
-            self.send_logout("Logout acknowledged").await;
+            self.send_logout("Logout acknowledged").await?;
         }
 
         self.application.on_logout("peer has logged us out").await;
@@ -377,7 +390,8 @@ where
         self.store.increment_target_seq_number().await?;
 
         self.send_message(Heartbeat::for_request(req_id.to_string()))
-            .await;
+            .await
+            .context("failed to send heartbeat in response to test request")?;
 
         Ok(())
     }
@@ -398,7 +412,9 @@ where
                 )
                 .session_reject_reason(SessionRejectReason::RequiredTagMissing)
                 .text("missing begin sequence number for resend request");
-                self.send_message(reject).await;
+                self.send_message(reject)
+                    .await
+                    .context("failed to send reject for invalid resend request")?;
                 return Ok(());
             }
         };
@@ -421,7 +437,9 @@ where
                 )
                 .session_reject_reason(SessionRejectReason::RequiredTagMissing)
                 .text("missing end sequence number for resend request");
-                self.send_message(reject).await;
+                self.send_message(reject)
+                    .await
+                    .context("failed to send reject for invalid resend request")?;
                 return Ok(());
             }
         };
@@ -429,7 +447,7 @@ where
         self.store.increment_target_seq_number().await?;
 
         self.resend_messages(begin_seq_number, end_seq_number, message)
-            .await;
+            .await?;
 
         Ok(())
     }
@@ -455,7 +473,7 @@ where
             .map_err(|_| anyhow!("failed to get seq number"))?;
         let is_gap_fill: bool = message.get(GAP_FILL_FLAG).unwrap_or(false);
         if let Err(err) = self.verify_message(message, is_gap_fill) {
-            self.handle_verification_error(err).await;
+            self.handle_verification_error(err).await?;
             return Ok(());
         }
 
@@ -469,7 +487,9 @@ where
                 let reject = Reject::new(msg_seq_num)
                     .session_reject_reason(SessionRejectReason::RequiredTagMissing)
                     .text("missing NewSeqNo tag in sequence reset message");
-                self.send_message(reject).await;
+                self.send_message(reject).await.context(
+                    "failed to send reject message in response to invalid sequence reset message",
+                )?;
 
                 // note: we don't increment the target seq number here
                 // this is an ambiguous case in the specification, but leaving the
@@ -489,14 +509,16 @@ where
             let reject = Reject::new(msg_seq_num)
                 .session_reject_reason(SessionRejectReason::ValueIsIncorrect)
                 .text(&text);
-            self.send_message(reject).await;
+            self.send_message(reject).await.context(
+                "failed to send reject message in response to invalid sequence reset message",
+            )?;
             return Ok(());
         }
 
         self.store.set_target_seq_number(end - 1).await
     }
 
-    async fn handle_verification_error(&mut self, error: MessageVerificationError) {
+    async fn handle_verification_error(&mut self, error: MessageVerificationError) -> Result<()> {
         match error {
             MessageVerificationError::SeqNumberTooLow {
                 expected,
@@ -507,7 +529,8 @@ where
                     .await;
             }
             MessageVerificationError::SeqNumberTooHigh { expected, actual } => {
-                self.handle_sequence_number_too_high(expected, actual).await;
+                self.handle_sequence_number_too_high(expected, actual)
+                    .await?;
             }
             MessageVerificationError::IncorrectBeginString(begin_string) => {
                 self.handle_incorrect_begin_string(begin_string).await;
@@ -541,6 +564,8 @@ where
                 .await;
             }
         }
+
+        Ok(())
     }
 
     async fn handle_incorrect_begin_string(&mut self, received_begin_string: String) {
@@ -562,7 +587,9 @@ where
         let reject = Reject::new(msg_seq_num)
             .session_reject_reason(SessionRejectReason::ValueIsIncorrect)
             .text(&format!("invalid comp ID {received_comp_id}"));
-        self.send_message(reject).await;
+        if let Err(err) = self.send_message(reject).await {
+            error!("failed to send reject message with invalid comp ID: {err}");
+        };
 
         self.logout_and_terminate("incorrect comp ID received")
             .await;
@@ -588,7 +615,7 @@ where
         self.state = SessionState::new_disconnected(false, &reason);
     }
 
-    async fn handle_sequence_number_too_high(&mut self, expected: u64, actual: u64) {
+    async fn handle_sequence_number_too_high(&mut self, expected: u64, actual: u64) -> Result<()> {
         match self
             .state
             .try_transition_to_awaiting_resend(expected, actual)
@@ -597,7 +624,9 @@ where
                 debug!(
                     "we are behind target (ours: {expected}, theirs: {actual}), requesting resend."
                 );
-                self.send_resend_request(expected, actual).await;
+                self.send_resend_request(expected, actual)
+                    .await
+                    .context("failed to send resend request")?;
             }
             AwaitingResendTransitionOutcome::InvalidState(reason) => {
                 error!("failed to request resend: {reason}");
@@ -617,6 +646,8 @@ where
                 );
             }
         }
+
+        Ok(())
     }
 
     async fn handle_invalid_msg_type(&mut self, message: Message, msg_type: &str) {
@@ -625,7 +656,9 @@ where
                 let reject = Reject::new(msg_seq_num)
                     .session_reject_reason(SessionRejectReason::InvalidMsgtype)
                     .text(&format!("invalid message type {msg_type}"));
-                self.send_message(reject).await;
+                if let Err(err) = self.send_message(reject).await {
+                    error!("failed to send reject message for invalid msgtype: {err}");
+                };
 
                 #[allow(clippy::collapsible_if)]
                 if let Ok(seq_num) = message.header().get::<u64>(MSG_SEQ_NUM)
@@ -646,7 +679,9 @@ where
         let reject = Reject::new(msg_seq_num)
             .session_reject_reason(SessionRejectReason::SendingtimeAccuracyProblem)
             .text(text);
-        self.send_message(reject).await;
+        if let Err(err) = self.send_message(reject).await {
+            error!("failed to send reject for time accuracy problem: {err}");
+        };
         if let Err(err) = self.store.increment_target_seq_number().await {
             error!("failed to increment target seq number: {:?}", err);
         };
@@ -656,19 +691,21 @@ where
         let reject = Reject::new(msg_seq_num)
             .session_reject_reason(SessionRejectReason::RequiredTagMissing)
             .text("original sending time is required");
-        self.send_message(reject).await;
+        if let Err(err) = self.send_message(reject).await {
+            error!("failed to send reject for time missing tag: {err}");
+        };
         if let Err(err) = self.store.increment_target_seq_number().await {
             error!("failed to increment target seq number: {:?}", err);
         };
     }
 
-    async fn resend_messages(&mut self, begin: u64, end: u64, _message: &Message) {
+    async fn resend_messages(&mut self, begin: u64, end: u64, _message: &Message) -> Result<()> {
         info!(begin, end, "resending messages as requested");
         let messages = self
             .store
             .get_slice(begin as usize, end as usize)
             .await
-            .unwrap();
+            .context("failed to retrieve messages from store")?;
 
         let no = messages.len();
         debug!(number_of_messages = no, "number of messages");
@@ -681,9 +718,18 @@ where
                 .message_builder
                 .build(msg.as_slice())
                 .into_message()
-                .unwrap();
-            sequence_number = message.header().get(MSG_SEQ_NUM).unwrap();
-            let message_type: String = message.header().get::<&str>(MSG_TYPE).unwrap().to_string();
+                .with_context(|| format!("failed to build message for raw message: {msg:?}"))?;
+            sequence_number = message.header().get::<u64>(MSG_SEQ_NUM).map_err(|e| {
+                anyhow!(
+                    "sequence number in message to resend is unexpectedly missing: {:?}",
+                    e
+                )
+            })?;
+            let message_type: String = message
+                .header()
+                .get::<&str>(MSG_TYPE)
+                .context("message type in message to resend is unexpectedly missing")?
+                .to_string();
 
             if is_admin(message_type.as_str()) {
                 if reset_start.is_none() {
@@ -695,7 +741,9 @@ where
             if let Some(begin) = reset_start {
                 let end = sequence_number;
                 Self::log_skipped_admin_messages(begin, end);
-                self.send_sequence_reset(begin, end).await;
+                self.send_sequence_reset(begin, end)
+                    .await
+                    .context("failed to send sequence reset")?;
                 reset_start = None;
             }
 
@@ -707,12 +755,15 @@ where
             }
             self.send_raw(
                 message_type.as_bytes(),
-                message.encode(&self.message_config).unwrap(),
+                message
+                    .encode(&self.message_config)
+                    .context("failed to encode message")?,
             )
             .await;
 
-            if enabled!(tracing::Level::DEBUG) {
-                let m = String::from_utf8(msg.clone()).unwrap();
+            if enabled!(tracing::Level::DEBUG)
+                && let Ok(m) = String::from_utf8(msg.clone())
+            {
                 debug!(sequence_number, message = m, "resent message");
             }
         }
@@ -721,8 +772,12 @@ where
             // the final reset if needed
             let end = sequence_number;
             Self::log_skipped_admin_messages(begin, end);
-            self.send_sequence_reset(begin, end).await;
+            self.send_sequence_reset(begin, end)
+                .await
+                .context("failed to send sequence reset")?;
         }
+
+        Ok(())
     }
 
     fn log_skipped_admin_messages(begin: u64, end: u64) {
@@ -742,25 +797,27 @@ where
             .reset_peer_timer(self.config.heartbeat_interval, test_request_id);
     }
 
-    async fn send_app_message(&mut self, message: Outbound) {
+    async fn send_app_message(&mut self, message: Outbound) -> Result<()> {
         match self.application.on_outbound_message(&message).await {
             OutboundDecision::Send => {
-                self.send_message(message).await;
+                self.send_message(message)
+                    .await
+                    .context("failed to send app message")?;
             }
             OutboundDecision::Drop => {
                 debug!("dropped outbound message as instructed by the application");
             }
             OutboundDecision::TerminateSession => {
-                error!("failed to send message to application");
+                warn!("the application indicated we should terminate the session");
                 self.state.disconnect_writer().await;
             }
         }
+
+        Ok(())
     }
 
-    async fn send_message(&mut self, message: impl OutboundMessage) {
+    async fn send_message(&mut self, message: impl OutboundMessage) -> Result<()> {
         let seq_num = self.store.next_sender_seq_number();
-        self.store.increment_sender_seq_number().await.unwrap();
-
         let msg_type = message.message_type().as_bytes().to_vec();
         let msg = generate_message(
             &self.config.begin_string,
@@ -769,9 +826,19 @@ where
             seq_num,
             message,
         )
-        .unwrap();
-        self.store.add(seq_num, &msg).await.unwrap();
+        .context("failed to generate message")?;
+        self.store
+            .increment_sender_seq_number()
+            .await
+            .context("failed to increment sender seq number")?;
+
+        self.store
+            .add(seq_num, &msg)
+            .await
+            .context("failed to add message to store")?;
         self.send_raw(&msg_type, msg).await;
+
+        Ok(())
     }
 
     async fn send_raw(&mut self, message_type: &[u8], data: Vec<u8>) {
@@ -781,7 +848,7 @@ where
         self.reset_heartbeat_timer();
     }
 
-    async fn send_sequence_reset(&mut self, begin: u64, end: u64) {
+    async fn send_sequence_reset(&mut self, begin: u64, end: u64) -> Result<()> {
         let sequence_reset = SequenceReset {
             gap_fill: true,
             new_seq_no: end,
@@ -793,20 +860,22 @@ where
             begin,
             sequence_reset,
         )
-        .unwrap();
+        .context("failed to generate message")?;
 
         self.send_raw(b"4", raw_message).await;
         debug!(begin, end, "sent reset sequence");
+
+        Ok(())
     }
 
-    async fn send_resend_request(&mut self, begin: u64, end: u64) {
+    async fn send_resend_request(&mut self, begin: u64, end: u64) -> Result<()> {
         let request = ResendRequest::new(begin, end);
-        self.send_message(request).await;
+        self.send_message(request).await
     }
 
-    async fn send_logon(&mut self) {
+    async fn send_logon(&mut self) -> Result<()> {
         let reset_config = if self.config.reset_on_logon || self.reset_on_next_logon {
-            self.store.reset().await.unwrap();
+            self.store.reset().await?;
             ResetSeqNumConfig::Reset
         } else {
             ResetSeqNumConfig::NoReset(Some(self.store.next_target_seq_number()))
@@ -815,12 +884,12 @@ where
 
         let logon = Logon::new(self.config.heartbeat_interval, reset_config);
 
-        self.send_message(logon).await;
+        self.send_message(logon).await
     }
 
-    async fn send_logout(&mut self, reason: &str) {
+    async fn send_logout(&mut self, reason: &str) -> Result<()> {
         let logout = Logout::with_reason(reason.to_string());
-        self.send_message(logout).await;
+        self.send_message(logout).await
     }
 
     /// Sends a logout message and immediately disconnects the counterparty.
@@ -831,7 +900,9 @@ where
     ///
     /// In other scenarios, [`initiate_graceful_logout`] should be preferred.
     async fn logout_and_terminate(&mut self, reason: &str) {
-        self.send_logout(reason).await;
+        if let Err(err) = self.send_logout(reason).await {
+            warn!("failed to send logout during session termination: {}", err);
+        }
         self.state.disconnect_writer().await;
     }
 
@@ -840,13 +911,15 @@ where
     /// The session waits for a configurable timeout period for the counterparty to
     /// respond with a `Logout` message. If no response is received within the timeout
     /// period, it disconnects the counterparty.
-    async fn initiate_graceful_logout(&mut self, reason: &str, reconnect: bool) {
+    async fn initiate_graceful_logout(&mut self, reason: &str, reconnect: bool) -> Result<()> {
         if self.state.try_transition_to_awaiting_logout(
             Duration::from_secs(self.config.logout_timeout),
             reconnect,
         ) {
-            self.send_logout(reason).await;
+            self.send_logout(reason).await?;
         }
+
+        Ok(())
     }
 
     async fn handle_session_event(&mut self, event: SessionEvent) {
@@ -866,12 +939,14 @@ where
                 self.on_disconnect(reason).await;
             }
             SessionEvent::Connected(w) => {
-                self.on_connect(w).await;
+                if let Err(err) = self.on_connect(w).await {
+                    error!(err = ?err, "failed to establish logon after connecting");
+                }
             }
             SessionEvent::ShouldReconnect(responder) => {
-                responder
-                    .send(self.state.should_reconnect())
-                    .expect("be able to respond");
+                if responder.send(self.state.should_reconnect()).is_err() {
+                    warn!("tried to respond to ShouldReconnect query but the receiver is gone");
+                }
             }
             SessionEvent::AwaitingActiveSession(responder) => {
                 self.state.register_session_awaiter(responder);
@@ -880,15 +955,21 @@ where
     }
 
     async fn handle_outbound_message(&mut self, message: Outbound) {
-        self.send_app_message(message).await;
+        if let Err(err) = self.send_app_message(message).await {
+            error!(err = ?err, "failed to send app message: {err}");
+        }
     }
 
     async fn handle_admin_request(&mut self, request: AdminRequest) {
         match request {
             AdminRequest::InitiateGracefulShutdown { reconnect } => {
                 warn!("initiating shutdown on request from admin..");
-                self.initiate_graceful_logout("explicitly requested", reconnect)
-                    .await;
+                if let Err(err) = self
+                    .initiate_graceful_logout("explicitly requested", reconnect)
+                    .await
+                {
+                    error!(err = ?err, "initiating graceful shutdown");
+                }
             }
             AdminRequest::RequestSessionInfo(responder) => {
                 info!("session info requested");
@@ -904,7 +985,9 @@ where
     }
 
     async fn handle_heartbeat_timeout(&mut self) {
-        self.send_message(Heartbeat::default()).await;
+        if let Err(err) = self.send_message(Heartbeat::default()).await {
+            error!(err = ?err, "failed to send heartbeat message");
+        }
     }
 
     async fn handle_peer_timeout(&mut self) {
@@ -921,7 +1004,9 @@ where
             let req_id = format!("TEST_{}", self.store.next_target_seq_number());
             info!("sending TestRequest due to peer timer expiring");
             let request = TestRequest::new(req_id.clone());
-            self.send_message(request).await;
+            if let Err(err) = self.send_message(request).await {
+                error!(err = ?err, "failed to send TestRequest");
+            }
             self.reset_peer_timer(Some(req_id));
         }
     }
@@ -956,8 +1041,12 @@ where
             }
         } else if self.state.is_connected() {
             // we are currently outside scheduled session time
-            self.initiate_graceful_logout("End of session time", true)
-                .await;
+            if let Err(err) = self
+                .initiate_graceful_logout("End of session time", true)
+                .await
+            {
+                error!(err = ?err, "failed to initiate graceful logout");
+            }
         }
 
         // we always need to reschedule the check, otherwise we won't be able to resume an inactive session
@@ -1033,4 +1122,385 @@ async fn run_session<App, Inbound, Outbound, Store>(
     }
 
     debug!("session is shutting down")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::{InboundDecision, OutboundDecision};
+    use crate::message::{InboundMessage, OutboundMessage};
+    use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Timelike};
+    use chrono_tz::Tz;
+    use hotfix_message::message::Message;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::mpsc;
+
+    /// A controllable store for testing that implements MessageStore
+    #[derive(Clone)]
+    struct TestStore {
+        creation_time: DateTime<Utc>,
+        fail_reset: Arc<AtomicBool>,
+        reset_called: Arc<AtomicBool>,
+        sender_seq: u64,
+        target_seq: u64,
+    }
+
+    impl TestStore {
+        fn new(creation_time: DateTime<Utc>) -> Self {
+            Self {
+                creation_time,
+                fail_reset: Arc::new(AtomicBool::new(false)),
+                reset_called: Arc::new(AtomicBool::new(false)),
+                sender_seq: 1,
+                target_seq: 1,
+            }
+        }
+
+        fn set_fail_reset(&self) {
+            self.fail_reset.store(true, Ordering::SeqCst);
+        }
+
+        fn was_reset_called(&self) -> bool {
+            self.reset_called.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageStore for TestStore {
+        async fn add(&mut self, _sequence_number: u64, _message: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_slice(&self, _begin: usize, _end: usize) -> Result<Vec<Vec<u8>>> {
+            Ok(vec![])
+        }
+
+        fn next_sender_seq_number(&self) -> u64 {
+            self.sender_seq
+        }
+
+        fn next_target_seq_number(&self) -> u64 {
+            self.target_seq
+        }
+
+        async fn increment_sender_seq_number(&mut self) -> Result<()> {
+            self.sender_seq += 1;
+            Ok(())
+        }
+
+        async fn increment_target_seq_number(&mut self) -> Result<()> {
+            self.target_seq += 1;
+            Ok(())
+        }
+
+        async fn set_target_seq_number(&mut self, seq_number: u64) -> Result<()> {
+            self.target_seq = seq_number;
+            Ok(())
+        }
+
+        async fn reset(&mut self) -> Result<()> {
+            self.reset_called.store(true, Ordering::SeqCst);
+            if self.fail_reset.load(Ordering::SeqCst) {
+                bail!("simulated reset failure")
+            }
+            self.creation_time = Utc::now();
+            Ok(())
+        }
+
+        fn creation_time(&self) -> DateTime<Utc> {
+            self.creation_time
+        }
+    }
+
+    /// Dummy message type for testing that implements required traits
+    #[derive(Clone)]
+    struct DummyMessage;
+
+    impl OutboundMessage for DummyMessage {
+        fn write(&self, _msg: &mut Message) {}
+        fn message_type(&self) -> &str {
+            "0"
+        }
+    }
+
+    impl InboundMessage for DummyMessage {
+        fn parse(_message: &Message) -> Self {
+            DummyMessage
+        }
+    }
+
+    /// Minimal no-op application for testing
+    struct NoOpApp;
+
+    #[async_trait::async_trait]
+    impl Application<DummyMessage, DummyMessage> for NoOpApp {
+        async fn on_outbound_message(&self, _: &DummyMessage) -> OutboundDecision {
+            OutboundDecision::Send
+        }
+        async fn on_inbound_message(&self, _: DummyMessage) -> InboundDecision {
+            InboundDecision::Accept
+        }
+        async fn on_logout(&mut self, _: &str) {}
+        async fn on_logon(&mut self) {}
+    }
+
+    fn create_writer_ref() -> WriterRef {
+        let (sender, _) = mpsc::channel(10);
+        WriterRef::new(sender)
+    }
+
+    fn create_test_config() -> SessionConfig {
+        SessionConfig {
+            begin_string: "FIX.4.4".to_string(),
+            sender_comp_id: "SENDER".to_string(),
+            target_comp_id: "TARGET".to_string(),
+            data_dictionary_path: None,
+            connection_host: "localhost".to_string(),
+            connection_port: 9876,
+            tls_config: None,
+            heartbeat_interval: 30,
+            logon_timeout: 10,
+            logout_timeout: 2,
+            reconnect_interval: 30,
+            reset_on_logon: false,
+            schedule: None,
+        }
+    }
+
+    fn create_test_session(
+        schedule: SessionSchedule,
+        state: SessionState,
+        store: TestStore,
+    ) -> Session<NoOpApp, DummyMessage, DummyMessage, TestStore> {
+        let config = create_test_config();
+        let message_config = MessageConfig::default();
+        let dictionary = Dictionary::fix44();
+        let message_builder = MessageBuilder::new(dictionary, message_config).unwrap();
+
+        Session {
+            message_config,
+            config,
+            schedule,
+            message_builder,
+            state,
+            application: NoOpApp,
+            store,
+            schedule_check_timer: Box::pin(sleep(Duration::from_secs(1))),
+            reset_on_next_logon: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Creates a Daily schedule that is active at the current time
+    fn create_active_schedule() -> SessionSchedule {
+        // Use a 24-hour window that's definitely active
+        SessionSchedule::Daily {
+            start_time: NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            end_time: NaiveTime::from_hms_opt(23, 59, 59).unwrap(),
+            timezone: Tz::UTC,
+        }
+    }
+
+    /// Creates a Daily schedule that is inactive at the current time
+    fn create_inactive_schedule() -> SessionSchedule {
+        let now = Utc::now();
+        let current_hour = now.time().hour();
+        // Create a 1-hour window that's 12 hours from now (definitely not the current hour)
+        let start_hour = (current_hour + 12) % 24;
+        let end_hour = (start_hour + 1) % 24;
+        SessionSchedule::Daily {
+            start_time: NaiveTime::from_hms_opt(start_hour, 0, 0).unwrap(),
+            end_time: NaiveTime::from_hms_opt(end_hour, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_schedule_check_active_same_period() {
+        // Use NonStop schedule - always active, always same period
+        let schedule = SessionSchedule::NonStop;
+        let writer = create_writer_ref();
+        let state = SessionState::new_active(writer, 30);
+        let store = TestStore::new(Utc::now());
+
+        let mut session = create_test_session(schedule, state, store);
+
+        session.handle_schedule_check().await;
+
+        // State should remain Active (no logout triggered)
+        assert!(
+            session.state.is_logged_on(),
+            "State should remain logged on for same period"
+        );
+        assert!(
+            !session.store.was_reset_called(),
+            "Store reset should not be called for same period"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_schedule_check_active_different_period() {
+        // Use a Daily schedule that's currently active
+        let schedule = create_active_schedule();
+        let writer = create_writer_ref();
+        let state = SessionState::new_active(writer, 30);
+        // Creation time is yesterday - different session period
+        let yesterday = Utc::now() - TimeDelta::days(1);
+        let store = TestStore::new(yesterday);
+
+        let mut session = create_test_session(schedule, state, store);
+
+        // Verify the schedule correctly identifies different periods
+        let now = Utc::now();
+        let creation_time = session.store.creation_time();
+        let same_period = session
+            .schedule
+            .is_same_session_period(&creation_time, &now);
+        assert!(
+            matches!(same_period, Ok(false)),
+            "Schedule should identify different periods"
+        );
+
+        session.handle_schedule_check().await;
+
+        // Store reset should have been called (indicates Ok(false) branch was taken)
+        // Note: logout_and_terminate disconnects the writer but state transition to
+        // Disconnected happens asynchronously via event processing, not in this call
+        assert!(
+            session.store.was_reset_called(),
+            "Store reset should be called for different period"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_schedule_check_active_reset_fails() {
+        // Use a Daily schedule that's currently active
+        let schedule = create_active_schedule();
+        let writer = create_writer_ref();
+        let state = SessionState::new_active(writer, 30);
+        // Creation time is yesterday - different session period
+        let yesterday = Utc::now() - TimeDelta::days(1);
+        let store = TestStore::new(yesterday);
+        store.set_fail_reset();
+
+        let mut session = create_test_session(schedule, state, store);
+
+        session.handle_schedule_check().await;
+
+        // Store reset should have been attempted
+        assert!(
+            session.store.was_reset_called(),
+            "Store reset should be called"
+        );
+        // When reset fails, state is explicitly set to Disconnected(reconnect=false)
+        assert!(
+            matches!(session.state, SessionState::Disconnected(_)),
+            "State should be Disconnected after reset failure"
+        );
+        // Should NOT reconnect since reset failed
+        assert!(
+            !session.state.should_reconnect(),
+            "Should not reconnect after failed reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_schedule_check_active_period_error() {
+        // Use a narrow schedule that's currently active but creation_time is outside
+        let now = Utc::now();
+        let current_hour = now.time().hour();
+
+        // Create a 2-hour window around current time
+        let start_hour = if current_hour == 0 {
+            23
+        } else {
+            current_hour - 1
+        };
+        let end_hour = (current_hour + 2) % 24;
+
+        let schedule = SessionSchedule::Daily {
+            start_time: NaiveTime::from_hms_opt(start_hour, 0, 0).unwrap(),
+            end_time: NaiveTime::from_hms_opt(end_hour, 0, 0).unwrap(),
+            timezone: Tz::UTC,
+        };
+
+        let writer = create_writer_ref();
+        let state = SessionState::new_active(writer, 30);
+
+        // Creation time is today but at a time outside the schedule window
+        // Use a time that's definitely outside the window (6 hours from now)
+        let outside_hour = (current_hour + 6) % 24;
+        let creation_time = DateTime::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(now.year(), now.month(), now.day())
+                .unwrap()
+                .and_hms_opt(outside_hour, 30, 0)
+                .unwrap(),
+            Utc,
+        );
+
+        let store = TestStore::new(creation_time);
+
+        let mut session = create_test_session(schedule, state, store);
+
+        // Verify that is_same_session_period will return an error
+        let same_period = session
+            .schedule
+            .is_same_session_period(&creation_time, &now);
+        assert!(
+            same_period.is_err(),
+            "Schedule should return error when creation_time is outside active window"
+        );
+
+        session.handle_schedule_check().await;
+
+        // The Err branch calls logout_and_terminate which disconnects the writer.
+        // Store reset is NOT called in the Err branch, only in Ok(false).
+        assert!(
+            !session.store.was_reset_called(),
+            "Store reset should not be called on period check error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_schedule_check_inactive_connected() {
+        // Use a schedule that's currently inactive
+        let schedule = create_inactive_schedule();
+        let writer = create_writer_ref();
+        let state = SessionState::new_active(writer, 30);
+        let store = TestStore::new(Utc::now());
+
+        let mut session = create_test_session(schedule, state, store);
+
+        session.handle_schedule_check().await;
+
+        // State should be AwaitingLogout (graceful logout initiated)
+        assert!(
+            session.state.is_awaiting_logout(),
+            "State should be AwaitingLogout when schedule is inactive and was connected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_schedule_check_inactive_disconnected() {
+        // Use a schedule that's currently inactive
+        let schedule = create_inactive_schedule();
+        let state = SessionState::new_disconnected(true, "test");
+        let store = TestStore::new(Utc::now());
+
+        let mut session = create_test_session(schedule, state, store);
+
+        session.handle_schedule_check().await;
+
+        // State should remain Disconnected (no action taken)
+        assert!(
+            matches!(session.state, SessionState::Disconnected(_)),
+            "State should remain Disconnected when schedule is inactive and was disconnected"
+        );
+        // Reconnect flag should be preserved
+        assert!(
+            session.state.should_reconnect(),
+            "Reconnect flag should be preserved"
+        );
+    }
 }
