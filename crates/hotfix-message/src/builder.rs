@@ -6,7 +6,6 @@ use crate::message::{Config, Message};
 use crate::parsed_message::{GarbledReason, InvalidReason, ParsedMessage};
 use crate::parts::{Body, Header, RepeatingGroup, Trailer};
 use crate::tags::{BEGIN_STRING, BODY_LENGTH, CHECK_SUM, MSG_TYPE};
-use anyhow::anyhow;
 use hotfix_dictionary::{Dictionary, LayoutItem, LayoutItemKind, TagU32};
 use std::collections::{HashMap, HashSet};
 
@@ -32,7 +31,7 @@ pub struct MessageBuilder {
 }
 
 impl MessageBuilder {
-    pub fn new(dict: Dictionary, config: Config) -> anyhow::Result<Self> {
+    pub fn new(dict: Dictionary, config: Config) -> ParserResult<Self> {
         let header_tags = Self::get_tags_for_component(&dict, "StandardHeader")?;
         let trailer_tags = Self::get_tags_for_component(&dict, "StandardTrailer")?;
         let message_definitions = build_message_specifications(&dict)?;
@@ -66,7 +65,8 @@ impl MessageBuilder {
             }
         };
 
-        let msg_type = header.get::<&str>(MSG_TYPE).unwrap(); // we know this is valid at this point as we have already verified the integrity of the header
+        #[allow(clippy::expect_used)]
+        let msg_type = header.get::<&str>(MSG_TYPE).expect("we know this is valid at this point as we have already verified the integrity of the header");
         let (body, next) = match self.build_body(msg_type, &mut parser, next) {
             Ok((body, field)) => (body, field),
             Err(err) => {
@@ -174,9 +174,10 @@ impl MessageBuilder {
             } else {
                 // check the message type once all other header fields have been parsed
                 // we delay it until after parsing so our rejection has access to fields like the sequence number
+                #[allow(clippy::expect_used)]
                 let msg_type = header
                     .get::<&str>(MSG_TYPE)
-                    .expect("this should never fail as we've verified the integrity of the header");
+                    .expect("this never fails as we've verified the integrity of the header");
                 if self.dict.message_by_msgtype(msg_type).is_none() {
                     return Err(ParserError::InvalidMsgType(msg_type.to_string()));
                 }
@@ -197,15 +198,17 @@ impl MessageBuilder {
         let mut field = next_field;
 
         while message_def.contains_tag(field.tag) {
-            let tag = field.tag.get();
+            let tag = field.tag;
             body.store_field(field);
 
             // check if it's the start of a group and parse the group as needed
-            let field_def = self.get_dict_field_by_tag(tag)?;
-            match message_def.get_group(TagU32::new(tag).unwrap()) {
+            let field_def = self.get_dict_field_by_tag(tag.get())?;
+            match message_def.get_group(tag) {
                 Some(group_def) => {
                     let (groups, next) = Self::parse_groups(parser, group_def, field_def.tag())?;
-                    body.set_groups(groups);
+                    #[allow(clippy::expect_used)]
+                    body.set_groups(groups)
+                        .expect("groups are guaranteed to be valid at this point");
                     field = next;
                 }
                 None => {
@@ -259,7 +262,10 @@ impl MessageBuilder {
                     {
                         let (groups, next) =
                             Self::parse_groups(parser, nested_group_def, current_tag)?;
-                        group.set_groups(groups);
+                        #[allow(clippy::expect_used)]
+                        group
+                            .set_groups(groups)
+                            .expect("groups are guaranteed to be valid at this point");
                         next
                     } else {
                         parser
@@ -316,11 +322,11 @@ impl MessageBuilder {
     fn get_tags_for_component(
         dict: &Dictionary,
         component_name: &str,
-    ) -> anyhow::Result<HashSet<TagU32>> {
+    ) -> ParserResult<HashSet<TagU32>> {
         let mut tags = HashSet::new();
         let component = dict
             .component_by_name(component_name)
-            .ok_or(ParserError::InvalidComponent(component_name.to_string()))?;
+            .ok_or_else(|| ParserError::InvalidComponent(component_name.to_string()))?;
         for item in component.items() {
             if let LayoutItemKind::Field(field) = item.kind() {
                 tags.insert(field.tag());
@@ -425,6 +431,7 @@ impl GroupSpecification {
     }
 
     pub fn delimiter_tag(&self) -> TagU32 {
+        #[allow(clippy::expect_used)]
         self.fields
             .first()
             .expect("groups always have at least one field")
@@ -457,7 +464,7 @@ impl MessageSpecification {
 
 fn build_message_specifications(
     dict: &Dictionary,
-) -> anyhow::Result<HashMap<String, MessageSpecification>> {
+) -> ParserResult<HashMap<String, MessageSpecification>> {
     let mut definitions = HashMap::new();
 
     for message in dict.messages() {
@@ -467,26 +474,25 @@ fn build_message_specifications(
             .flatten()
             .collect();
 
-        let message_def = MessageSpecification {
-            fields,
-            groups: message.layout().fold(HashMap::new(), |mut acc, item| {
-                acc.extend(extract_groups(dict, item).unwrap());
-                acc
-            }),
-        };
+        let mut groups = HashMap::new();
+        for item in message.layout() {
+            groups.extend(extract_groups(dict, item)?);
+        }
+
+        let message_def = MessageSpecification { fields, groups };
         definitions.insert(message.msg_type().to_string(), message_def);
     }
 
     Ok(definitions)
 }
 
-fn extract_fields(dict: &Dictionary, item: LayoutItem) -> anyhow::Result<Vec<FieldSpecification>> {
+fn extract_fields(dict: &Dictionary, item: LayoutItem) -> ParserResult<Vec<FieldSpecification>> {
     let is_required = item.required();
     let fields = match item.kind() {
         LayoutItemKind::Component(c) => {
             let component = dict
                 .component_by_name(c.name())
-                .ok_or_else(|| anyhow!("missing component"))?;
+                .ok_or_else(|| ParserError::InvalidComponent(c.name().to_string()))?;
             component
                 .items()
                 .flat_map(|i| extract_fields(dict, i))
@@ -509,18 +515,22 @@ fn extract_fields(dict: &Dictionary, item: LayoutItem) -> anyhow::Result<Vec<Fie
 fn extract_groups(
     dict: &Dictionary,
     item: LayoutItem,
-) -> anyhow::Result<HashMap<TagU32, GroupSpecification>> {
+) -> ParserResult<HashMap<TagU32, GroupSpecification>> {
     let mut groups = HashMap::new();
     match item.kind() {
         LayoutItemKind::Component(c) => {
             let component = dict
                 .component_by_name(c.name())
-                .ok_or_else(|| anyhow!("missing component"))?;
-            component.items().for_each(|i| {
-                groups.extend(extract_groups(dict, i).unwrap());
-            })
+                .ok_or_else(|| ParserError::InvalidComponent(c.name().to_string()))?;
+            for i in component.items() {
+                groups.extend(extract_groups(dict, i)?);
+            }
         }
         LayoutItemKind::Group(field, items) => {
+            let mut nested_groups = HashMap::new();
+            for i in items.iter() {
+                nested_groups.extend(extract_groups(dict, i.clone())?);
+            }
             groups.insert(
                 field.tag(),
                 GroupSpecification {
@@ -530,10 +540,7 @@ fn extract_groups(
                         .flat_map(|i| extract_fields(dict, i.clone()))
                         .flatten()
                         .collect(),
-                    nested_groups: items.iter().fold(HashMap::new(), |mut acc, i| {
-                        acc.extend(extract_groups(dict, i.clone()).unwrap());
-                        acc
-                    }),
+                    nested_groups,
                 },
             );
         }
