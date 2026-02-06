@@ -18,15 +18,17 @@ pub struct HttpSessionController<Outbound> {
 #[async_trait::async_trait]
 impl<Outbound: OutboundMessage> SessionController for HttpSessionController<Outbound> {
     async fn get_session_info(&self) -> anyhow::Result<SessionInfo> {
-        self.session_handle.get_session_info().await
+        Ok(self.session_handle.get_session_info().await?)
     }
 
     async fn request_reset_on_next_logon(&self) -> anyhow::Result<()> {
-        self.session_handle.request_reset_on_next_logon().await
+        self.session_handle.request_reset_on_next_logon().await?;
+        Ok(())
     }
 
     async fn shutdown(&self, reconnect: bool) -> anyhow::Result<()> {
-        self.session_handle.shutdown(reconnect).await
+        self.session_handle.shutdown(reconnect).await?;
+        Ok(())
     }
 }
 
