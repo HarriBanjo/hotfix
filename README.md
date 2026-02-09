@@ -12,34 +12,33 @@
 
 </div>
 
-
-> **Warning**
->
-> HotFIX is currently in development with frequent breaking changes to the API
-> and some features missing.
-
 ### Overview
 
-HotFIX is a [FIX](https://www.fixtrading.org/standards/) engine implemented in Rust.
-While the ambition is to create a robust, fully compliant, ergonomic and performant engine eventually,
-this is a large undertaking.
-
-The near-term goal of HotFIX is to provide a functional and useful engine for the buy-side (initiators),
-reaching full support of FIX 4.4 and 5.0 workflows as soon as possible.
+HotFIX is a [FIX](https://www.fixtrading.org/standards/) engine implemented in Rust,
+focused on buy-side (initiator) workflows. It fully supports FIX 4.4 and the current
+focus is on expanding support to other FIX versions. Performance is roughly on par with
+various QuickFIX implementations, with long-term plans to optimise further.
 
 ### Features & status
 
 - [x] Network layer including TCP transport with optional TLS support using `rustls`
-- [x] Message encoding and decoding (FIX 4.4)
+- [x] Message encoding and decoding
 - [x] Session-layer supporting the core flows, such as logins, resends, etc.
 - [x] Built-in message stores
     - [x] in-memory
     - [x] file-system
     - [x] [mongodb](https://www.mongodb.com/docs/drivers/rust/current/)
-    - [x] [redb](https://www.redb.org/)
 - [x] Code-generation for FIX fields from XML specifications
-- [ ] FIX 5.0 support
+- [x] Web API and CLI for session monitoring and management
 - [ ] Code-generation for complete FIX messages from XML specification
+
+### FIX version support
+
+| Version | Status                              |
+|---------|-------------------------------------|
+| FIX 4.2 | Should work, but currently untested |
+| FIX 4.4 | Fully supported                     |
+| FIX 5.0 | Planned                             |
 
 Check out the [examples](https://github.com/Validus-Risk-Management/hotfix/tree/main/examples)
 to get started.
@@ -58,16 +57,17 @@ parsing the XML specification, defining fields, etc.
 
 ### Contributions
 
-In its current state, the engine has a lot of issues that will be fixed
-in due course, so please don't create issues or PRs for individual bugs.
+If you're on the buy side and working with FIX 4.4, HotFIX should be ready for
+your use case.
+If you run into any issues, please file a bug report on
+[GitHub Issues](https://github.com/Validus-Risk-Management/hotfix/issues).
 
-We welcome committed contributors who want to work with us to turn this
-into a successful project. There are many components that can be developed
-in parallel. If you are interested in participating, don't hesitate to
-reach out.
-
-The best way to get in touch is by
-[starting a Discussion](https://github.com/Validus-Risk-Management/hotfix/discussions).
+Contributions towards larger features outside the current roadmap — for example,
+extending HotFIX to support acceptor (sell-side) workflows — are very welcome.
+For these, open an
+[Issue](https://github.com/Validus-Risk-Management/hotfix/issues) or start a
+[Discussion](https://github.com/Validus-Risk-Management/hotfix/discussions)
+to coordinate.
 
 [crates-badge]: https://img.shields.io/crates/v/hotfix.svg
 
