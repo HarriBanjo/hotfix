@@ -140,9 +140,15 @@ where
         message: Message,
         reason: InvalidReason,
     ) -> Result<(), SessionOperationError> {
-        let (mut ctx, writer) = self.make_ctx();
+        let writer = self.state.get_writer();
         let Some(writer) = writer else {
             return Ok(());
+        };
+        let mut ctx = SessionCtx {
+            config: &self.config,
+            store: &mut self.store,
+            message_builder: &self.message_builder,
+            message_config: &self.message_config,
         };
         ctx.handle_invalid_parsed_message(writer, &message, reason)
             .await
@@ -256,7 +262,7 @@ where
             SessionState::Active(s) => Some(s.on_disconnect(&reason).await),
             SessionState::AwaitingLogon(s) => Some(s.on_disconnect(&reason).await),
             SessionState::AwaitingResend(s) => Some(s.on_disconnect(&reason).await),
-            SessionState::AwaitingLogout(s) => Some(s.on_disconnect(&reason)),
+            SessionState::AwaitingLogout(s) => Some(s.on_disconnect(&reason).await),
             SessionState::Disconnected(_) => {
                 warn!("disconnect message was received, but the session is already disconnected");
                 None
@@ -265,17 +271,6 @@ where
         if let Some(new_state) = transition {
             self.state = new_state;
         }
-    }
-
-    fn make_ctx(&mut self) -> (SessionCtx<'_, Store>, Option<&WriterRef>) {
-        let writer = self.state.get_writer();
-        let ctx = SessionCtx {
-            config: &self.config,
-            store: &mut self.store,
-            message_builder: &self.message_builder,
-            message_config: &self.message_config,
-        };
-        (ctx, writer)
     }
 
     async fn send_logon(&mut self) -> Result<(), SessionOperationError> {
@@ -288,7 +283,13 @@ where
         self.reset_on_next_logon = false;
 
         let logon = Logon::new(self.config.heartbeat_interval, reset_config);
-        let (mut ctx, writer) = self.make_ctx();
+        let writer = self.state.get_writer();
+        let mut ctx = SessionCtx {
+            config: &self.config,
+            store: &mut self.store,
+            message_builder: &self.message_builder,
+            message_config: &self.message_config,
+        };
         if let Some(writer) = writer {
             ctx.send_message(writer, logon)
                 .await
@@ -299,7 +300,13 @@ where
 
     async fn send_logout(&mut self, reason: &str) -> Result<(), SessionOperationError> {
         let logout = Logout::with_reason(reason.to_string());
-        let (mut ctx, writer) = self.make_ctx();
+        let writer = self.state.get_writer();
+        let mut ctx = SessionCtx {
+            config: &self.config,
+            store: &mut self.store,
+            message_builder: &self.message_builder,
+            message_config: &self.message_config,
+        };
         if let Some(writer) = writer {
             ctx.send_message(writer, logout)
                 .await
@@ -324,11 +331,11 @@ where
             return Ok(());
         };
 
-        self.state = SessionState::AwaitingLogout(state::AwaitingLogoutState {
+        self.state = SessionState::AwaitingLogout(state::AwaitingLogoutState::new(
             writer,
-            logout_timeout: Instant::now() + Duration::from_secs(self.config.logout_timeout),
+            Instant::now() + Duration::from_secs(self.config.logout_timeout),
             reconnect,
-        });
+        ));
         self.send_logout(reason).await?;
 
         Ok(())
@@ -547,7 +554,7 @@ where
                         .await;
                 }
             }
-        } else if self.state.get_writer().is_some()
+        } else if self.state.is_connected()
             && let Err(err) = self
                 .initiate_graceful_logout("End of session time", true)
                 .await

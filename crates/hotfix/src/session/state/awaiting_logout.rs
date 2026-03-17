@@ -16,7 +16,15 @@ pub(crate) struct AwaitingLogoutState {
 }
 
 impl AwaitingLogoutState {
-    pub(crate) fn on_disconnect(&self, reason: &str) -> SessionState {
+    pub(crate) fn new(writer: WriterRef, logout_timeout: Instant, reconnect: bool) -> Self {
+        Self {
+            writer,
+            logout_timeout,
+            reconnect,
+        }
+    }
+
+    pub(crate) async fn on_disconnect(&self, reason: &str) -> SessionState {
         SessionState::new_disconnected(self.reconnect, reason)
     }
 

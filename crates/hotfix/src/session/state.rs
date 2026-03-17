@@ -63,6 +63,10 @@ impl SessionState {
         }
     }
 
+    pub(crate) fn is_connected(&self) -> bool {
+        self.get_writer().is_some()
+    }
+
     pub(crate) fn get_writer(&self) -> Option<&WriterRef> {
         match self {
             Self::Active(ActiveState { writer, .. })
