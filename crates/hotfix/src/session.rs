@@ -1102,23 +1102,28 @@ where
     }
 
     async fn handle_peer_timeout(&mut self) {
-        if self.state.is_expecting_test_response() {
-            warn!("peer didn't respond, terminating..");
-            self.logout_and_terminate("peer timeout").await;
-        } else if self.state.is_awaiting_logon() {
-            warn!("peer didn't respond to our Logon, disconnecting..");
-            self.state.disconnect_writer().await;
-        } else if self.state.is_awaiting_logout() {
-            warn!("peer didn't respond to our Logout, disconnecting..");
-            self.state.disconnect_writer().await;
-        } else {
-            let req_id = format!("TEST_{}", self.store.next_target_seq_number());
-            info!("sending TestRequest due to peer timer expiring");
-            let request = TestRequest::new(req_id.clone());
-            if let Err(err) = self.send_message(request).await {
-                error!(err = ?err, "failed to send TestRequest");
+        let Session {
+            ref mut state,
+            ref mut store,
+            ref config,
+            ..
+        } = *self;
+        let transition = match state {
+            SessionState::Active(active) => {
+                let mut ctx = SessionCtx { config, store };
+                active.on_peer_timeout(&mut ctx).await
             }
-            self.reset_peer_timer(Some(req_id));
+            SessionState::AwaitingLogon(awaiting_logon) => {
+                awaiting_logon.on_peer_timeout().await;
+                None
+            }
+            SessionState::AwaitingLogout(awaiting_logout) => {
+                Some(awaiting_logout.on_peer_timeout().await)
+            }
+            _ => None,
+        };
+        if let Some(new_state) = transition {
+            self.state = new_state;
         }
     }
 
@@ -1616,7 +1621,7 @@ mod tests {
 
         // State should be AwaitingLogout (graceful logout initiated)
         assert!(
-            session.state.is_awaiting_logout(),
+            matches!(session.state, SessionState::AwaitingLogout(_)),
             "State should be AwaitingLogout when schedule is inactive and was connected"
         );
     }

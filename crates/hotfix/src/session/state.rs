@@ -307,14 +307,6 @@ impl SessionState {
         self.expected_test_response_id().is_some()
     }
 
-    pub fn is_awaiting_logon(&self) -> bool {
-        matches!(self, SessionState::AwaitingLogon(_))
-    }
-
-    pub fn is_awaiting_logout(&self) -> bool {
-        matches!(self, SessionState::AwaitingLogout(_))
-    }
-
     pub fn as_status(&self) -> SessionInfoStatus {
         match self {
             SessionState::AwaitingLogon(_) => SessionInfoStatus::AwaitingLogon,

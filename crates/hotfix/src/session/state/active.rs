@@ -1,10 +1,12 @@
 use crate::message::heartbeat::Heartbeat;
-use crate::session::state::{SessionCtx, TestRequestId};
+use crate::message::logout::Logout;
+use crate::message::test_request::TestRequest;
+use crate::session::state::{SessionCtx, SessionState, TestRequestId};
 use crate::transport::writer::WriterRef;
 use hotfix_store::MessageStore;
 use std::time::Duration;
 use tokio::time::Instant;
-use tracing::error;
+use tracing::{error, info, warn};
 
 pub(crate) struct ActiveState {
     /// The writer's reference to send messages to the counterparty
@@ -42,6 +44,36 @@ impl ActiveState {
 
     pub(crate) fn expected_test_response_id(&self) -> Option<&TestRequestId> {
         self.sent_test_request_id.as_ref()
+    }
+
+    pub(crate) async fn on_peer_timeout<Store: MessageStore>(
+        &mut self,
+        ctx: &mut SessionCtx<'_, Store>,
+    ) -> Option<SessionState> {
+        if self.sent_test_request_id.is_some() {
+            warn!("peer didn't respond, terminating..");
+            let logout = Logout::with_reason("peer timeout".to_string());
+            if let Ok(prepared) = ctx.prepare_message(logout).await {
+                self.writer.send_raw_message(prepared.raw).await;
+            }
+            self.writer.disconnect().await;
+            return Some(SessionState::new_disconnected(true, "peer timeout"));
+        }
+
+        let req_id = format!("TEST_{}", ctx.store.next_target_seq_number());
+        info!("sending TestRequest due to peer timer expiring");
+        let request = TestRequest::new(req_id.clone());
+        match ctx.prepare_message(request).await {
+            Ok(prepared) => {
+                self.writer.send_raw_message(prepared.raw).await;
+                self.reset_heartbeat_timer(ctx.config.heartbeat_interval);
+            }
+            Err(err) => {
+                error!(err = ?err, "failed to send TestRequest");
+            }
+        }
+        self.reset_peer_timer(ctx.config.heartbeat_interval, Some(req_id));
+        None
     }
 
     pub(crate) async fn on_heartbeat_timeout<Store: MessageStore>(
