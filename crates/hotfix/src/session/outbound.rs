@@ -5,12 +5,22 @@ use tracing::{debug, enabled, error, info};
 use crate::message::generate_message;
 use crate::message::parser::RawFixMessage;
 use crate::message::sequence_reset::SequenceReset;
-use crate::message::{is_admin, prepare_message_for_resend};
+use crate::message::{OutboundMessage, is_admin, prepare_message_for_resend};
 use crate::session::ctx::SessionCtx;
-use crate::session::error::SessionOperationError;
+use crate::session::error::{InternalSendError, SessionOperationError};
 use crate::session::get_msg_seq_num;
 use crate::transport::writer::WriterRef;
 use hotfix_message::session_fields::MSG_TYPE;
+
+pub async fn send_message<A, S: MessageStore>(
+    ctx: &mut SessionCtx<A, S>,
+    writer: &WriterRef,
+    message: impl OutboundMessage,
+) -> Result<u64, InternalSendError> {
+    let prepared = ctx.prepare_message(message).await?;
+    writer.send_raw_message(prepared.raw).await;
+    Ok(prepared.seq_num)
+}
 
 pub async fn send_sequence_reset<A, S: MessageStore>(
     ctx: &mut SessionCtx<A, S>,
@@ -121,83 +131,13 @@ fn log_skipped_admin_messages(begin: u64, end: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SessionConfig;
-    use crate::session::ctx::SessionCtx;
-    use crate::store::Result as StoreResult;
-    use chrono::{DateTime, Utc};
-    use hotfix_message::MessageBuilder;
-    use hotfix_message::dict::Dictionary;
-    use hotfix_message::message::Config as MessageConfig;
+    use crate::session::test_utils::*;
     use tokio::sync::mpsc;
-
-    #[derive(Clone)]
-    struct GarbledMessageStore {
-        messages: Vec<Vec<u8>>,
-    }
-
-    #[async_trait::async_trait]
-    impl MessageStore for GarbledMessageStore {
-        async fn add(&mut self, _: u64, _: &[u8]) -> StoreResult<()> {
-            Ok(())
-        }
-        async fn get_slice(&self, _: usize, _: usize) -> StoreResult<Vec<Vec<u8>>> {
-            Ok(self.messages.clone())
-        }
-        fn next_sender_seq_number(&self) -> u64 {
-            1
-        }
-        fn next_target_seq_number(&self) -> u64 {
-            1
-        }
-        async fn increment_sender_seq_number(&mut self) -> StoreResult<()> {
-            Ok(())
-        }
-        async fn increment_target_seq_number(&mut self) -> StoreResult<()> {
-            Ok(())
-        }
-        async fn set_target_seq_number(&mut self, _: u64) -> StoreResult<()> {
-            Ok(())
-        }
-        async fn reset(&mut self) -> StoreResult<()> {
-            Ok(())
-        }
-        fn creation_time(&self) -> DateTime<Utc> {
-            Utc::now()
-        }
-    }
-
-    fn create_test_ctx(store: GarbledMessageStore) -> SessionCtx<(), GarbledMessageStore> {
-        let message_config = MessageConfig::default();
-        let dictionary = Dictionary::fix44();
-        let message_builder = MessageBuilder::new(dictionary, message_config).unwrap();
-        SessionCtx {
-            config: SessionConfig {
-                begin_string: "FIX.4.4".to_string(),
-                sender_comp_id: "SENDER".to_string(),
-                target_comp_id: "TARGET".to_string(),
-                data_dictionary_path: None,
-                connection_host: "localhost".to_string(),
-                connection_port: 9876,
-                tls_config: None,
-                heartbeat_interval: 30,
-                logon_timeout: 10,
-                logout_timeout: 2,
-                reconnect_interval: 30,
-                reset_on_logon: false,
-                schedule: None,
-            },
-            store,
-            application: (),
-            message_builder,
-            message_config,
-        }
-    }
 
     #[tokio::test]
     async fn resend_messages_returns_error_for_garbled_stored_message() {
-        let store = GarbledMessageStore {
-            messages: vec![b"not a valid FIX message".to_vec()],
-        };
+        let mut store = FakeMessageStore::new();
+        store.messages = vec![b"not a valid FIX message".to_vec()];
         let mut ctx = create_test_ctx(store);
         let (sender, _receiver) = mpsc::channel(10);
         let writer = WriterRef::new(sender);

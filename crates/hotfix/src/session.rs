@@ -2,11 +2,14 @@ pub(crate) mod admin_request;
 mod ctx;
 pub mod error;
 pub(crate) mod event;
+mod inbound;
 mod info;
 mod outbound;
 mod session_handle;
 pub mod session_ref;
 mod state;
+#[cfg(test)]
+mod test_utils;
 
 use chrono::Utc;
 use hotfix_message::dict::Dictionary;
@@ -31,13 +34,13 @@ use crate::message::reject::Reject;
 use crate::message::resend_request::ResendRequest;
 use crate::message::sequence_reset::SequenceReset;
 use crate::message::test_request::TestRequest;
-use crate::message::verification::verify_message;
-use crate::message::verification_error::{CompIdType, MessageVerificationError};
+use crate::message::verification_error::MessageVerificationError;
 use crate::session::admin_request::AdminRequest;
-use crate::session::ctx::SessionCtx;
+use crate::session::ctx::{SessionCtx, TransitionResult};
 use crate::session::error::SessionCreationError;
 use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
 pub use crate::session::error::{SendError, SendOutcome};
+use crate::session::inbound::verify_message_with_ctx;
 pub use crate::session::info::{SessionInfo, Status};
 pub use crate::session::session_handle::SessionHandle;
 #[cfg(not(feature = "test-utils"))]
@@ -160,7 +163,15 @@ where
                     warn!("received invalid component");
                 }
                 InvalidReason::InvalidMsgType(msg_type) => {
-                    self.handle_invalid_msg_type(message, &msg_type).await;
+                    if let Some(writer) = self.state.get_writer() {
+                        inbound::handle_invalid_msg_type(
+                            &mut self.ctx,
+                            writer,
+                            &message,
+                            &msg_type,
+                        )
+                        .await;
+                    }
                 }
                 InvalidReason::InvalidOrderInGroup { tag, .. } => {
                     match message.header().get(MSG_SEQ_NUM) {
@@ -242,7 +253,7 @@ where
         &mut self,
         message: &Message,
     ) -> Result<(), SessionOperationError> {
-        match self.verify_message(message, true, true) {
+        match verify_message_with_ctx(&self.ctx, message, true, true) {
             Ok(_) => {
                 match self.ctx.application.on_inbound_message(message).await {
                     InboundDecision::Accept => {}
@@ -315,26 +326,6 @@ where
         Ok(())
     }
 
-    fn verify_message(
-        &self,
-        message: &Message,
-        check_too_high: bool,
-        check_too_low: bool,
-    ) -> Result<(), MessageVerificationError> {
-        let expected_seq_number = if check_too_high || check_too_low {
-            Some(self.ctx.store.next_target_seq_number())
-        } else {
-            None
-        };
-        verify_message(
-            message,
-            &self.ctx.config,
-            expected_seq_number,
-            check_too_high,
-            check_too_low,
-        )
-    }
-
     async fn on_connect(&mut self, writer: WriterRef) -> Result<(), SessionOperationError> {
         self.state = SessionState::AwaitingLogon(AwaitingLogonState {
             writer,
@@ -366,7 +357,7 @@ where
 
     async fn on_logon(&mut self, message: &Message) -> Result<(), SessionOperationError> {
         if let SessionState::AwaitingLogon(AwaitingLogonState { writer, .. }) = &self.state {
-            match self.verify_message(message, true, true) {
+            match verify_message_with_ctx(&self.ctx, message, true, true) {
                 Ok(_) => {
                     // happy logon flow, the session is now active
                     self.state = SessionState::new_active(
@@ -386,13 +377,15 @@ where
     }
 
     async fn on_logout(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, false, false) {
+        if let Err(err) = verify_message_with_ctx(&self.ctx, message, false, false) {
             self.handle_verification_error(err).await?;
             return Ok(());
         }
 
         if self.state.is_logged_on() {
-            self.send_logout("Logout acknowledged").await?;
+            self.state
+                .send_logout(&mut self.ctx, "Logout acknowledged")
+                .await?;
         }
 
         self.ctx
@@ -420,7 +413,7 @@ where
     }
 
     async fn on_heartbeat(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, true, true) {
+        if let Err(err) = verify_message_with_ctx(&self.ctx, message, true, true) {
             self.handle_verification_error(err).await?;
             return Ok(());
         }
@@ -439,7 +432,7 @@ where
     }
 
     async fn on_test_request(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, true, true) {
+        if let Err(err) = verify_message_with_ctx(&self.ctx, message, true, true) {
             self.handle_verification_error(err).await?;
             return Ok(());
         }
@@ -468,7 +461,7 @@ where
         // This is the key part of the QFJ-673 deadlock fix: when both sides send ResendRequest
         // simultaneously, each side's ResendRequest will have a seq number higher than expected.
         // By not treating that as an error, we allow the ResendRequest to be processed.
-        match self.verify_message(message, false, true) {
+        match verify_message_with_ctx(&self.ctx, message, false, true) {
             Ok(_) => {}
             Err(err) => {
                 self.handle_verification_error(err).await?;
@@ -536,7 +529,7 @@ where
 
     /// Handle Reject messages.
     async fn on_reject(&mut self, message: &Message) -> Result<(), SessionOperationError> {
-        if let Err(err) = self.verify_message(message, false, true) {
+        if let Err(err) = verify_message_with_ctx(&self.ctx, message, false, true) {
             self.handle_verification_error(err).await?;
             return Ok(());
         }
@@ -548,7 +541,7 @@ where
     async fn on_sequence_reset(&mut self, message: &Message) -> Result<(), SessionOperationError> {
         let msg_seq_num = get_msg_seq_num(message);
         let is_gap_fill: bool = message.get(GAP_FILL_FLAG).unwrap_or(false);
-        if let Err(err) = self.verify_message(message, is_gap_fill, is_gap_fill) {
+        if let Err(err) = verify_message_with_ctx(&self.ctx, message, is_gap_fill, is_gap_fill) {
             self.handle_verification_error(err).await?;
             return Ok(());
         }
@@ -605,94 +598,95 @@ where
                 actual,
                 possible_duplicate,
             } => {
-                self.handle_sequence_number_too_low(expected, actual, possible_duplicate)
+                if let Some(writer) = self.state.get_writer() {
+                    let result = inbound::handle_sequence_number_too_low(
+                        &mut self.ctx,
+                        writer,
+                        expected,
+                        actual,
+                        possible_duplicate,
+                    )
                     .await;
+                    self.apply_transition(result);
+                }
             }
             MessageVerificationError::SeqNumberTooHigh { expected, actual } => {
                 self.handle_sequence_number_too_high(expected, actual)
                     .await?;
             }
             MessageVerificationError::IncorrectBeginString(begin_string) => {
-                self.handle_incorrect_begin_string(begin_string).await;
+                if let Some(writer) = self.state.get_writer() {
+                    let result =
+                        inbound::handle_incorrect_begin_string(&mut self.ctx, writer, begin_string)
+                            .await;
+                    self.apply_transition(result);
+                }
             }
             MessageVerificationError::IncorrectCompId {
                 comp_id,
                 comp_id_type,
                 msg_seq_num,
             } => {
-                self.handle_incorrect_comp_id(comp_id, comp_id_type, msg_seq_num)
+                if let Some(writer) = self.state.get_writer() {
+                    let result = inbound::handle_incorrect_comp_id(
+                        &mut self.ctx,
+                        writer,
+                        comp_id,
+                        comp_id_type,
+                        msg_seq_num,
+                    )
                     .await;
+                    self.apply_transition(result);
+                }
             }
             MessageVerificationError::SendingTimeAccuracyIssue { msg_seq_num } => {
-                self.handle_sending_time_accuracy_problem(msg_seq_num, "unexpected sending time")
+                if let Some(writer) = self.state.get_writer() {
+                    inbound::handle_sending_time_accuracy_problem(
+                        &mut self.ctx,
+                        writer,
+                        msg_seq_num,
+                        "unexpected sending time",
+                    )
                     .await;
+                }
             }
             MessageVerificationError::SendingTimeMissing { msg_seq_num } => {
-                self.handle_sending_time_accuracy_problem(msg_seq_num, "sending time missing")
+                if let Some(writer) = self.state.get_writer() {
+                    inbound::handle_sending_time_accuracy_problem(
+                        &mut self.ctx,
+                        writer,
+                        msg_seq_num,
+                        "sending time missing",
+                    )
                     .await;
+                }
             }
             MessageVerificationError::OriginalSendingTimeMissing { msg_seq_num } => {
-                self.handle_original_sending_time_missing(msg_seq_num).await;
+                if let Some(writer) = self.state.get_writer() {
+                    inbound::handle_original_sending_time_missing(
+                        &mut self.ctx,
+                        writer,
+                        msg_seq_num,
+                    )
+                    .await;
+                }
             }
             MessageVerificationError::OriginalSendingTimeAfterSendingTime {
                 msg_seq_num, ..
             } => {
-                self.handle_sending_time_accuracy_problem(
-                    msg_seq_num,
-                    "original sending time is after sending time",
-                )
-                .await;
+                if let Some(writer) = self.state.get_writer() {
+                    inbound::handle_sending_time_accuracy_problem(
+                        &mut self.ctx,
+                        writer,
+                        msg_seq_num,
+                        "original sending time is after sending time",
+                    )
+                    .await;
+                }
             }
         }
 
         Ok(())
-    }
-
-    async fn handle_incorrect_begin_string(&mut self, received_begin_string: String) {
-        self.logout_and_terminate(&format!(
-            "beginString={received_begin_string} is not supported"
-        ))
-        .await;
-    }
-
-    async fn handle_incorrect_comp_id(
-        &mut self,
-        received_comp_id: String,
-        comp_id_type: CompIdType,
-        msg_seq_num: u64,
-    ) {
-        error!(
-            "rejecting message with incorrect comp ID: {received_comp_id} (type: {comp_id_type:?})"
-        );
-        let reject = Reject::new(msg_seq_num)
-            .session_reject_reason(SessionRejectReason::ValueIsIncorrect)
-            .text(&format!("invalid comp ID {received_comp_id}"));
-        if let Err(err) = self.send_message(reject).await {
-            error!("failed to send reject message with invalid comp ID: {err}");
-        };
-
-        self.logout_and_terminate("incorrect comp ID received")
-            .await;
-    }
-
-    async fn handle_sequence_number_too_low(
-        &mut self,
-        expected: u64,
-        actual: u64,
-        possible_duplicate: bool,
-    ) {
-        if possible_duplicate {
-            warn!(
-                "sequence number too low (expected {expected}, actual {actual}, but counterparty indicated it's poss duplicate, ignoring"
-            );
-            return;
-        }
-        error!(
-            "we expected {expected} sequence number, but target sent lower ({actual}), terminating..."
-        );
-        let reason = format!("sequence number too low (actual {actual}, expected {expected})");
-        self.logout_and_terminate(&reason).await;
-        self.state = SessionState::new_disconnected(false, &reason);
     }
 
     async fn handle_sequence_number_too_high(
@@ -732,53 +726,10 @@ where
         Ok(())
     }
 
-    async fn handle_invalid_msg_type(&mut self, message: Message, msg_type: &str) {
-        match message.header().get(MSG_SEQ_NUM) {
-            Ok(msg_seq_num) => {
-                let reject = Reject::new(msg_seq_num)
-                    .session_reject_reason(SessionRejectReason::InvalidMsgtype)
-                    .text(&format!("invalid message type {msg_type}"));
-                if let Err(err) = self.send_message(reject).await {
-                    error!("failed to send reject message for invalid msgtype: {err}");
-                };
-
-                #[allow(clippy::collapsible_if)]
-                if let Ok(seq_num) = message.header().get::<u64>(MSG_SEQ_NUM)
-                    && self.ctx.store.next_target_seq_number() == seq_num
-                {
-                    if let Err(err) = self.ctx.store.increment_target_seq_number().await {
-                        error!("failed to increment target seq number: {:?}", err);
-                    };
-                }
-            }
-            Err(err) => {
-                error!("failed to get message seq num: {:?}", err);
-            }
+    fn apply_transition(&mut self, result: TransitionResult) {
+        if let TransitionResult::TransitionTo(new_state) = result {
+            self.state = new_state;
         }
-    }
-
-    async fn handle_sending_time_accuracy_problem(&mut self, msg_seq_num: u64, text: &str) {
-        let reject = Reject::new(msg_seq_num)
-            .session_reject_reason(SessionRejectReason::SendingtimeAccuracyProblem)
-            .text(text);
-        if let Err(err) = self.send_message(reject).await {
-            error!("failed to send reject for time accuracy problem: {err}");
-        };
-        if let Err(err) = self.ctx.store.increment_target_seq_number().await {
-            error!("failed to increment target seq number: {:?}", err);
-        };
-    }
-
-    async fn handle_original_sending_time_missing(&mut self, msg_seq_num: u64) {
-        let reject = Reject::new(msg_seq_num)
-            .session_reject_reason(SessionRejectReason::RequiredTagMissing)
-            .text("original sending time is required");
-        if let Err(err) = self.send_message(reject).await {
-            error!("failed to send reject for time missing tag: {err}");
-        };
-        if let Err(err) = self.ctx.store.increment_target_seq_number().await {
-            error!("failed to increment target seq number: {:?}", err);
-        };
     }
 
     fn reset_heartbeat_timer(&mut self) {
@@ -817,11 +768,7 @@ where
         &mut self,
         message: impl OutboundMessage,
     ) -> Result<u64, InternalSendError> {
-        let msg_type = message.message_type().to_string();
-        let prepared = self.ctx.prepare_message(message).await?;
-        self.state.send_message(&msg_type, prepared.raw).await;
-        self.reset_heartbeat_timer();
-        Ok(prepared.seq_num)
+        self.state.send_message(&mut self.ctx, message).await
     }
 
     async fn send_resend_request(
@@ -850,48 +797,6 @@ where
         Ok(())
     }
 
-    async fn send_logout(&mut self, reason: &str) -> Result<(), SessionOperationError> {
-        let logout = Logout::with_reason(reason.to_string());
-        self.send_message(logout)
-            .await
-            .with_send_context("logout")?;
-        Ok(())
-    }
-
-    /// Sends a logout message and immediately disconnects the counterparty.
-    ///
-    /// This should be used sparingly in scenarios where there is a major issue
-    /// requiring operational intervention, such as the sequence number being lower
-    /// than expected, or some other key header field containing an invalid value.
-    ///
-    /// In other scenarios, [`initiate_graceful_logout`] should be preferred.
-    async fn logout_and_terminate(&mut self, reason: &str) {
-        if let Err(err) = self.send_logout(reason).await {
-            warn!("failed to send logout during session termination: {}", err);
-        }
-        self.state.disconnect_writer().await;
-    }
-
-    /// Sends a logout message and puts the session state into an [`AwaitingLogout`] state.
-    ///
-    /// The session waits for a configurable timeout period for the counterparty to
-    /// respond with a `Logout` message. If no response is received within the timeout
-    /// period, it disconnects the counterparty.
-    async fn initiate_graceful_logout(
-        &mut self,
-        reason: &str,
-        reconnect: bool,
-    ) -> Result<(), SessionOperationError> {
-        if self.state.try_transition_to_awaiting_logout(
-            Duration::from_secs(self.ctx.config.logout_timeout),
-            reconnect,
-        ) {
-            self.send_logout(reason).await?;
-        }
-
-        Ok(())
-    }
-
     async fn handle_session_event(&mut self, event: SessionEvent) {
         self.handle_schedule_check().await;
 
@@ -900,7 +805,9 @@ where
                 if let Err(err) = self.on_incoming(fix_message).await {
                     let reason = err.to_string();
                     error!(reason, "fatal error in message processing");
-                    self.logout_and_terminate("internal error").await;
+                    self.state
+                        .logout_and_terminate(&mut self.ctx, "internal error")
+                        .await;
                     self.state = SessionState::new_disconnected(true, &reason);
                 }
             }
@@ -945,7 +852,8 @@ where
             AdminRequest::InitiateGracefulShutdown { reconnect } => {
                 warn!("initiating shutdown on request from admin..");
                 if let Err(err) = self
-                    .initiate_graceful_logout("explicitly requested", reconnect)
+                    .state
+                    .initiate_graceful_logout(&mut self.ctx, "explicitly requested", reconnect)
                     .await
                 {
                     error!(err = ?err, "initiating graceful shutdown");
@@ -973,7 +881,9 @@ where
     async fn handle_peer_timeout(&mut self) {
         if self.state.is_expecting_test_response() {
             warn!("peer didn't respond, terminating..");
-            self.logout_and_terminate("peer timeout").await;
+            self.state
+                .logout_and_terminate(&mut self.ctx, "peer timeout")
+                .await;
         } else if self.state.is_awaiting_logon() {
             warn!("peer didn't respond to our Logon, disconnecting..");
             self.state.disconnect_writer().await;
@@ -1007,7 +917,9 @@ where
                 Ok(SessionPeriodComparison::DifferentPeriod) => {
                     // the message store is for a previous session,
                     // we need to terminate this session, reset the store, and reestablish the session
-                    self.logout_and_terminate("session period changed").await;
+                    self.state
+                        .logout_and_terminate(&mut self.ctx, "session period changed")
+                        .await;
                     if let Err(err) = self.ctx.store.reset().await {
                         error!("error resetting session store: {err:}");
                         self.state =
@@ -1018,7 +930,8 @@ where
                     // the creation_time was recorded outside the session schedule,
                     // treat this similarly to a different period - reset the store
                     warn!("store creation time is outside session schedule, resetting store");
-                    self.logout_and_terminate("creation time outside schedule")
+                    self.state
+                        .logout_and_terminate(&mut self.ctx, "creation time outside schedule")
                         .await;
                     if let Err(err) = self.ctx.store.reset().await {
                         error!("error resetting session store: {err:}");
@@ -1029,13 +942,16 @@ where
                 Err(err) => {
                     // actual schedule calculation error (e.g., DST transition, date overflow)
                     error!("error checking session period: {err:?}");
-                    self.logout_and_terminate("internal error").await;
+                    self.state
+                        .logout_and_terminate(&mut self.ctx, "internal error")
+                        .await;
                 }
             }
         } else if self.state.is_connected() {
             // we are currently outside scheduled session time
             if let Err(err) = self
-                .initiate_graceful_logout("End of session time", true)
+                .state
+                .initiate_graceful_logout(&mut self.ctx, "End of session time", true)
                 .await
             {
                 error!(err = ?err, "failed to initiate graceful logout");
