@@ -107,3 +107,76 @@ impl From<oneshot::error::RecvError> for SessionGone {
         Self(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::Message;
+    use crate::message::OutboundMessage;
+    use crate::session::admin_request::AdminRequest;
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct TestMessage;
+
+    impl OutboundMessage for TestMessage {
+        fn write(&self, _msg: &mut Message) {}
+        fn message_type(&self) -> &str {
+            "TEST"
+        }
+    }
+
+    fn create_test_session_ref() -> (
+        InternalSessionRef<TestMessage>,
+        mpsc::Receiver<SessionEvent>,
+    ) {
+        let (event_sender, event_receiver) = mpsc::channel::<SessionEvent>(100);
+        let (outbound_message_sender, _outbound_receiver) =
+            mpsc::channel::<OutboundRequest<TestMessage>>(10);
+        let (admin_request_sender, _admin_receiver) = mpsc::channel::<AdminRequest>(10);
+
+        let session_ref = InternalSessionRef {
+            event_sender,
+            outbound_message_sender,
+            admin_request_sender,
+        };
+
+        (session_ref, event_receiver)
+    }
+
+    #[tokio::test]
+    async fn await_in_schedule_returns_in_schedule_when_session_responds_in_schedule() {
+        let (session_ref, mut event_receiver) = create_test_session_ref();
+
+        tokio::spawn(async move {
+            if let Some(SessionEvent::AwaitSchedule(responder)) = event_receiver.recv().await {
+                let _ = responder.send(ScheduleResponse::InSchedule);
+            }
+        });
+
+        let result = session_ref.await_in_schedule().await;
+        assert!(matches!(result, Ok(ScheduleResponse::InSchedule)));
+    }
+
+    #[tokio::test]
+    async fn await_in_schedule_returns_shutdown_when_session_responds_shutdown() {
+        let (session_ref, mut event_receiver) = create_test_session_ref();
+
+        tokio::spawn(async move {
+            if let Some(SessionEvent::AwaitSchedule(responder)) = event_receiver.recv().await {
+                let _ = responder.send(ScheduleResponse::Shutdown);
+            }
+        });
+
+        let result = session_ref.await_in_schedule().await;
+        assert!(matches!(result, Ok(ScheduleResponse::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn await_in_schedule_returns_err_when_event_channel_closed() {
+        let (session_ref, event_receiver) = create_test_session_ref();
+        drop(event_receiver);
+
+        let result = session_ref.await_in_schedule().await;
+        assert!(result.is_err());
+    }
+}
