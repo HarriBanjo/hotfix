@@ -82,16 +82,13 @@ impl<Outbound: OutboundMessage> InternalSessionRef<Outbound> {
         Ok(receiver.await?)
     }
 
-    pub async fn await_in_schedule(&self) -> Result<(), SessionGone> {
+    pub async fn await_in_schedule(&self) -> Result<ScheduleResponse, SessionGone> {
         debug!("awaiting in-schedule time");
         let (sender, receiver) = oneshot::channel::<ScheduleResponse>();
         self.event_sender
             .send(SessionEvent::AwaitSchedule(sender))
             .await?;
-        receiver.await?;
-
-        debug!("resuming connection as schedule is active");
-        Ok(())
+        Ok(receiver.await?)
     }
 }
 
