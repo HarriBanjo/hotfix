@@ -39,7 +39,7 @@ use crate::session::admin_request::AdminRequest;
 use crate::session::ctx::{PreProcessDecision, SessionCtx, TransitionResult, VerificationResult};
 use crate::session::error::SessionCreationError;
 use crate::session::error::{InternalSendError, InternalSendResultExt, SessionOperationError};
-pub use crate::session::error::{SendError, SendOutcome};
+pub use crate::session::error::{SendError, SendOutcome, SetNextTargetSeqNumError};
 pub use crate::session::info::{SessionInfo, Status};
 pub use crate::session::session_handle::SessionHandle;
 #[cfg(not(feature = "test-utils"))]
@@ -567,6 +567,22 @@ where
             AdminRequest::ResetSequenceNumbersOnNextLogon => {
                 warn!("resetting sequence numbers on next logon");
                 self.reset_on_next_logon = true;
+            }
+            AdminRequest::SetNextTargetSeqNum { seq_num, responder } => {
+                let response = self
+                    .state
+                    .try_set_next_target_seq_num(&mut self.ctx, seq_num)
+                    .await;
+                if let Err(ref err) = response {
+                    warn!(
+                        ?err,
+                        seq_num = seq_num.get(),
+                        "SetNextTargetSeqNum rejected"
+                    );
+                }
+                if responder.send(response).is_err() {
+                    error!("failed to respond to SetNextTargetSeqNum request");
+                }
             }
         }
     }
