@@ -487,7 +487,15 @@ where
         };
         self.reset_on_next_logon = false;
 
-        let logon = Logon::new(self.ctx.config.heartbeat_interval, reset_config);
+        let extra_fields: Vec<(u32, String)> = self
+            .ctx
+            .config
+            .logon_fields
+            .iter()
+            .map(|f| (f.tag, f.value.clone()))
+            .collect();
+        let logon = Logon::new(self.ctx.config.heartbeat_interval, reset_config)
+            .with_extra_fields(extra_fields);
         self.send_message(logon).await.with_send_context("logon")?;
         Ok(())
     }
@@ -906,6 +914,7 @@ mod tests {
             logout_timeout: 2,
             reconnect_interval: 30,
             reset_on_logon: false,
+            logon_fields: Vec::new(),
             schedule: None,
         }
     }
