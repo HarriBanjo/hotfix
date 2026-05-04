@@ -118,6 +118,7 @@ pub fn create_session_config() -> SessionConfig {
         logout_timeout: LOGOUT_TIMEOUT,
         reconnect_interval: 30,
         reset_on_logon: false,
+        logon_fields: Vec::new(),
         schedule: None,
     }
 }

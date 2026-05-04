@@ -167,6 +167,7 @@ fn get_config() -> SessionConfig {
         logout_timeout: 2,
         reconnect_interval: 30,
         reset_on_logon: true,
+        logon_fields: Vec::new(),
         schedule: None,
     }
 }

@@ -53,6 +53,20 @@ pub struct ScheduleConfig {
     pub timezone: Option<Tz>,
 }
 
+/// A custom field appended to outgoing Logon (35=A) messages.
+///
+/// Some FIX counterparties require fields beyond the FIX 4.4 standard Logon
+/// body, such as Username (553) and Password (554) for authentication, or a
+/// vendor-specific session token. Use [`SessionConfig::logon_fields`] to add
+/// them.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct LogonField {
+    /// FIX tag number to set on the outgoing Logon.
+    pub tag: u32,
+    /// Field value. Encoded to bytes as-is (no FIX-level escaping).
+    pub value: String,
+}
+
 fn default_reconnect_interval() -> u64 {
     30
 }
@@ -111,6 +125,25 @@ pub struct SessionConfig {
     /// Specifies whether we should reset the state of the message store on logon.
     #[serde(default)]
     pub reset_on_logon: bool,
+
+    /// Custom fields to append to every outgoing Logon (35=A) message.
+    ///
+    /// Standard fields (EncryptMethod, HeartBtInt, ResetSeqNumFlag,
+    /// NextExpectedMsgSeqNum) are always written first; entries from this list
+    /// are written after, in order. The most common use is supplying
+    /// authentication fields such as Username (553) and Password (554).
+    ///
+    /// Example TOML:
+    /// ```toml
+    /// [[sessions.logon_fields]]
+    /// tag = 553
+    /// value = "my-user"
+    /// [[sessions.logon_fields]]
+    /// tag = 554
+    /// value = "my-token"
+    /// ```
+    #[serde(default)]
+    pub logon_fields: Vec<LogonField>,
 
     /// The schedule configuration for the session
     pub schedule: Option<ScheduleConfig>,

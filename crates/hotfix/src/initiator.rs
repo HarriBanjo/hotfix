@@ -308,6 +308,7 @@ mod tests {
             logout_timeout: 2,
             reconnect_interval: 1, // Short for tests
             reset_on_logon: false,
+            logon_fields: Vec::new(),
             schedule: None,
         }
     }
